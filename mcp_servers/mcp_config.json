@@ -1,0 +1,22 @@
+{
+  "weather": {
+    "type": "stdio",
+    "command": "python",
+    "args": ["mcp_servers/weather/server.py"],
+    "display_name": "天气服务",
+    "description": "查询城市天气和天气预报，支持 get_weather 和 get_forecast"
+  },
+  "notes": {
+    "type": "stdio",
+    "command": "python",
+    "args": ["mcp_servers/notes/server.py"],
+    "display_name": "便签服务",
+    "description": "创建和管理便签，支持 create_note 和 list_notes"
+  },
+  "calculator": {
+    "type": "sse",
+    "url": "http://127.0.0.1:8090/sse",
+    "display_name": "计算器服务",
+    "description": "数学计算和单位换算，支持 calculate 和 convert_unit。需先单独启动：python mcp_servers/calculator/server.py"
+  }
+}

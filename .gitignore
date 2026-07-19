@@ -59,6 +59,15 @@ node_modules/
 /server/temp/
 /server/uploads/
 
+# MCP 运行时数据
+# mcp_cache：V2 工具 schema 磁盘缓存，运行时自动生成，不提交
+/server/mcp_cache/
+# MCP server 的用户数据目录（如 notes MCP 生成的便签文件）
+mcp_servers/*/data/
+
+# ===== 临时脚本 =====
+test_mcp.py
+
 # OpenSpec 变更记录：仅归档目录纳入版本管理，未归档的属于个人工作区
 openspec/changes/*
 !openspec/changes/archive/
