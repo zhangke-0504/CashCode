@@ -482,6 +482,39 @@ class MemoryStore:
         ]
 
     # ------------------------------------------------------------------
+    # Session metadata（V2 新增：供 ActivatedToolSet 等跨轮次状态存储使用）
+    # ------------------------------------------------------------------
+
+    def _metadata_file(self, chat_id: str) -> Path:
+        return self._chat_dir(chat_id) / "metadata.json"
+
+    def read_session_metadata(self, chat_id: str) -> dict[str, Any]:
+        """读取 chat_id 对应的 session metadata。文件不存在时返回空 dict。"""
+        path = self._metadata_file(chat_id)
+        if not path.exists():
+            return {}
+        try:
+            return json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            logger.warning("Failed to read session metadata for %s, returning empty", chat_id)
+            return {}
+
+    def write_session_metadata(self, chat_id: str, data: dict[str, Any]) -> None:
+        """原子写入 chat_id 对应的 session metadata。"""
+        import os
+        import uuid as _uuid
+        path = self._metadata_file(chat_id)
+        tmp = path.with_name(f".{path.name}.{os.getpid()}.{_uuid.uuid4().hex}.tmp")
+        try:
+            tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+            os.replace(tmp, path)
+        finally:
+            try:
+                tmp.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+    # ------------------------------------------------------------------
     # 内部辅助
     # ------------------------------------------------------------------
 

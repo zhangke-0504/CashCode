@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 """SimpleAgentRunner：非流式 ReAct 循环，处理工具调用阶段。
 
 参考 spore ``core.agent.runner.AgentRunner``，去掉收敛策略、工具审批、mid-turn 注入等
@@ -16,7 +17,7 @@ from typing import Any, Callable, Awaitable
 
 from openai import AsyncOpenAI
 
-from .tools.base import Tool
+from .tools.registry import ToolRegistry
 
 logger = logging.getLogger(__name__)
 
@@ -59,7 +60,7 @@ class SimpleAgentRunner:
     async def run(
         self,
         messages: list[dict[str, Any]],
-        tools: list[Tool],
+        registry: ToolRegistry,
         *,
         chat_id: str = "",
         stream_id: int = 0,
@@ -69,14 +70,13 @@ class SimpleAgentRunner:
         updated_messages 包含完整的工具调用链（tool_calls + tool_results + 最终回复），
         供 loop.py 同步到 in-memory history 并持久化到 history.jsonl。
 
-        若没有工具或 LLM 直接返回文字，则 updated_messages == 原始 messages（无修改）。
+        若 registry 为空或 LLM 直接返回文字，则 updated_messages == 原始 messages。
         """
-        if not tools:
+        schemas = registry.get_definitions()
+        if not schemas:
             # 无工具：直接非流式调用，返回文字
             return await self._call_llm_text(messages), messages
 
-        schemas = [t.to_openai_schema() for t in tools]
-        tool_map = {t.name: t for t in tools}
         working = list(messages)
 
         for iteration in range(self.MAX_ITERATIONS):
@@ -125,26 +125,17 @@ class SimpleAgentRunner:
                 # WS 通知：工具调用开始
                 await self._notify_tool_call(chat_id, stream_id, tool_name, kwargs)
 
-                # 执行工具
-                tool = tool_map.get(tool_name)
-                if tool is None:
-                    result = f"未知工具：{tool_name}"
-                    logger.warning("Runner: unknown tool '%s'", tool_name)
-                else:
-                    try:
-                        result = await tool.execute(**kwargs)
-                    except Exception:
-                        result = f"工具 {tool_name} 执行失败"
-                        logger.exception("Runner: tool '%s' raised", tool_name)
+                # 通过 registry 执行工具（内置或 MCP 工具统一接口）
+                result = await registry.execute(tool_name, kwargs)
 
                 # WS 通知：工具执行完成
-                await self._notify_tool_result(chat_id, stream_id, tool_name, result)
+                await self._notify_tool_result(chat_id, stream_id, tool_name, str(result))
 
                 # 追加工具结果消息
                 working.append({
                     "role": "tool",
                     "tool_call_id": call.id,
-                    "content": result,
+                    "content": str(result),
                 })
 
         # 超出最大迭代次数：强制结束

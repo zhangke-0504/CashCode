@@ -53,6 +53,9 @@ class Tool(ABC):
             },
         }
 
+    # ToolRegistry 调用此方法——与 to_openai_schema 等价
+    to_schema = to_openai_schema
+
     @abstractmethod
     async def execute(self, **kwargs: Any) -> str:
         """执行工具，返回结果字符串（供 LLM 读取）。

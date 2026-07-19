@@ -1,13 +1,17 @@
+# -*- coding: utf-8 -*-
 """SimpleAgentLoop：读取 InboundMessage，调用 DeepSeek（含工具），再发布 OutboundMessage。
 
-这是 spore ``core.agent.loop.AgentLoop`` 的精简版本，包含：
-- 纯 LLM 对话循环（无工具时直接流式）
-- 工具调用循环（通过 SimpleAgentRunner，Phase 1 非流式 + Phase 2 fake streaming）
-- SaveMemoryTool：LLM 主动将重要事实写入 MEMORY.md
+V2 变更：
+- MCP server 不再在启动时连接，只读取配置 + disk cache
+- 每轮绑定 ActivatedToolSet（懒加载自 session metadata）
+- 工具传 DeferredAwareRegistry，MCP 工具默认 deferred
+- 内置 ToolSearchTool + MCPPrepareTool（永远可见）
+- 轮次结束时写回 session metadata 到磁盘
 """
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import time
@@ -21,6 +25,16 @@ from ..bus.queue import MessageBus
 from ..memory.store import MemoryStore
 from ..memory.consolidator import SimpleConsolidator
 from .runner import SimpleAgentRunner
+from .tools.registry import ToolRegistry
+from .tools.mcp import lazy_connect, load_mcp_tools, MCPConnectionHandle, MCPToolWrapper
+from .tools.mcp_cache import read_cache, write_cache
+from .tools.tool_search import (
+    ActivatedToolSet,
+    DeferredAwareRegistry,
+    ToolSearchTool,
+    MCPPrepareTool,
+    use_activated_set,
+)
 from .tools.memory import SaveMemoryTool
 from .tools.web import WebFetchTool, WebSearchTool
 from .tools.filesystem import ReadFileTool, WriteFileTool, EditFileTool, ListDirTool
@@ -29,8 +43,6 @@ from .tools.shell import ExecTool
 
 logger = logging.getLogger(__name__)
 
-# 当 memory/SOUL.md 不存在时使用的默认 Agent 身份。
-# 存在 SOUL.md 时该常量不生效，用户可直接编辑文件调整 Agent 人格。
 _DEFAULT_SOUL = (
     "你是 CashCode，一个具备跨会话持久记忆能力的 AI 助手。"
     "你与用户的对话会被后台自动整理成长期记忆，并在新会话中自动恢复，"
@@ -43,46 +55,41 @@ _DEFAULT_SOUL = (
 
 
 class SimpleAgentLoop:
-    """最简 Agent 循环：维护 chat_id → 对话历史，并调用 DeepSeek API。
+    """最简 Agent 循环（V2）：MCP 工具延迟激活，按需连接。
 
-    每轮处理流程（含工具）：
-      1. 懒加载会话历史。
-      2. Phase 1：SimpleAgentRunner 工具循环（非流式），每次工具调用通过 WS 通知用户。
-      3. Phase 2：将最终回复以分块 fake streaming 方式发给用户。
-      4. 持久化（含工具链或普通轮次）。
-      5. 上下文压缩检查（Consolidator）。
+    每轮处理流程：
+      1. 懒加载会话历史 + session metadata。
+      2. 绑定 ActivatedToolSet 到当前 async task。
+      3. Phase 1：SimpleAgentRunner 工具循环（传 DeferredAwareRegistry）。
+      4. Phase 2：Fake streaming 发给前端。
+      5. 持久化对话历史 + session metadata。
+      6. 上下文压缩检查。
     """
 
-    # Fake streaming 每块的字符数
     _STREAM_CHUNK_SIZE: int = 15
 
     def __init__(self, bus: MessageBus) -> None:
         self.bus = bus
-        # 以 chat_id 为键、保存在内存中的对话历史（运行时缓存）。
-        # 首次遇到某 chat_id 时从 MemoryStore 懒加载，后续轮次直接读缓存。
         self._sessions: dict[str, list[dict[str, Any]]] = {}
-        # Consolidator 的压缩边界指针：记录每个 chat_id 内存历史中已压缩的消息数量。
-        # 重启后通过 load_history_smart() 重新推导，运行时由 maybe_consolidate 返回值更新。
         self._last_consolidated: dict[str, int] = {}
-        # 持久化层：history.jsonl 按 chat_id 分目录存储在 memory/ 下。
+        self._session_metadata: dict[str, dict] = {}   # V2: per-chat_id 元数据缓存
         self._store = MemoryStore(Path("memory"))
 
-        api_key = os.environ.get("DEEPSEEK_API_KEY", "")
+        api_key  = os.environ.get("DEEPSEEK_API_KEY", "")
         api_base = os.environ.get("DEEPSEEK_API_BASE", "https://api.deepseek.com")
         self._model = os.environ.get("DEEPSEEK_MODEL", "deepseek-chat")
 
         if not api_key:
-            raise RuntimeError(
-                "DEEPSEEK_API_KEY not set — add it to server/.env"
-            )
+            raise RuntimeError("DEEPSEEK_API_KEY not set — add it to server/.env")
 
         self._client = AsyncOpenAI(api_key=api_key, base_url=api_base)
-        # 上下文压缩器：在 client/model 初始化完成后注入，字符数超阈值时自动摘要旧消息。
         self._consolidator = SimpleConsolidator(self._client, self._model, self._store)
-        # 工作目录：文件系统工具和 ExecTool 限制在此目录内。
+
         workspace = Path(os.environ.get("WORKSPACE_DIR", ".")).resolve()
-        # 工具列表：SaveMemoryTool + Web + 文件系统 + 搜索 + Shell。
-        self._tools = [
+
+        # FullRegistry：内置工具（MCP 工具在 mcp_prepare 后动态注册进来）
+        self._registry = ToolRegistry()
+        for tool in [
             SaveMemoryTool(self._store),
             WebFetchTool(),
             WebSearchTool(),
@@ -93,8 +100,24 @@ class SimpleAgentLoop:
             GlobTool(workspace),
             GrepTool(workspace),
             ExecTool(workspace),
-        ]
-        # ReAct 循环 Runner：工具调用阶段使用非流式 API。
+        ]:
+            self._registry.register(tool)
+
+        # V2: DeferredAwareRegistry 包装 FullRegistry
+        self._deferred_registry = DeferredAwareRegistry(self._registry)
+
+        # V2: MCP 配置（只存配置，不建连接）
+        self._mcp_config: dict[str, dict] = {}
+        self._mcp_handles: dict[str, MCPConnectionHandle] = {}
+
+        # V2: ToolSearchTool 和 MCPPrepareTool 注册到 DeferredAwareRegistry（永远可见）
+        self._deferred_registry.register(
+            ToolSearchTool(self._registry, self._mcp_config)
+        )
+        self._deferred_registry.register(
+            MCPPrepareTool(self._prepare_mcp_server, self._registry)
+        )
+
         self._runner = SimpleAgentRunner(
             self._client, self._model,
             on_tool_call=self._on_tool_call,
@@ -102,16 +125,96 @@ class SimpleAgentLoop:
         )
         self._running = False
 
+    # ------------------------------------------------------------------
+    # MCP 初始化（V2：只读配置，不建连接）
+    # ------------------------------------------------------------------
+
+    async def _setup_mcp(self) -> None:
+        """读取 mcp_config.json，存入 self._mcp_config，不建立任何连接。
+
+        disk cache 里的工具 schema 会预先加载，使 tool_search 在首次连接前也能搜索。
+        """
+        _project_root = Path(__file__).resolve().parent.parent.parent.parent
+        config_path = _project_root / "mcp_servers" / "mcp_config.json"
+        if not config_path.exists():
+            logger.info("MCP config not found at %s, no MCP servers configured", config_path)
+            return
+
+        try:
+            servers: dict = json.loads(config_path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            logger.warning("Failed to parse MCP config: %s", exc)
+            return
+
+        if not isinstance(servers, dict) or not servers:
+            return
+
+        # 将相对 args 路径转为绝对路径
+        for cfg in servers.values():
+            if not isinstance(cfg, dict):
+                continue
+            cfg["args"] = [
+                str((_project_root / Path(a)).resolve()) if not Path(a).is_absolute() else a
+                for a in cfg.get("args", [])
+            ]
+
+        self._mcp_config.update(servers)
+        logger.info(
+            "MCP config loaded (lazy mode): %d server(s) configured, no connections yet",
+            len(servers),
+        )
+
+    # ------------------------------------------------------------------
+    # prepare callback（注入给 MCPPrepareTool）
+    # ------------------------------------------------------------------
+
+    async def _prepare_mcp_server(self, server_name: str) -> bool:
+        """MCPPrepareTool 的回调：按需连接 server + list_tools + write_cache + register."""
+        cfg = self._mcp_config.get(server_name)
+        if cfg is None:
+            logger.warning("_prepare_mcp_server: '%s' not in config", server_name)
+            return False
+
+        ok = await lazy_connect(server_name, cfg, self._mcp_handles)
+        if not ok:
+            return False
+
+        session = self._mcp_handles[server_name].session
+        if session is None:
+            return False
+
+        try:
+            result = await session.list_tools()
+        except Exception as exc:
+            logger.warning("_prepare_mcp_server: list_tools failed for '%s': %s", server_name, exc)
+            return False
+
+        tools_data: list[dict] = []
+        for tool_def in result.tools:
+            wrapper = MCPToolWrapper(session, server_name, tool_def)
+            self._registry.register(wrapper)
+            tools_data.append({
+                "name": tool_def.name,
+                "description": tool_def.description or "",
+                "inputSchema": tool_def.inputSchema or {},
+            })
+        write_cache(server_name, cfg, tools_data)
+        logger.info("_prepare_mcp_server: '%s' ready, %d tool(s)", server_name, len(tools_data))
+        return True
+
+    # ------------------------------------------------------------------
+    # 主循环
+    # ------------------------------------------------------------------
+
     async def run(self) -> None:
-        """主循环：消费入站消息，并为每轮对话创建任务。"""
         self._running = True
-        logger.info("SimpleAgentLoop started (model=%s)", self._model)
+        logger.info("SimpleAgentLoop starting (model=%s, MCP=lazy)", self._model)
+        await self._setup_mcp()
+        logger.info("SimpleAgentLoop started")
         try:
             while self._running:
                 try:
-                    msg = await asyncio.wait_for(
-                        self.bus.consume_inbound(), timeout=1.0
-                    )
+                    msg = await asyncio.wait_for(self.bus.consume_inbound(), timeout=1.0)
                 except asyncio.TimeoutError:
                     continue
                 asyncio.create_task(self._handle_turn(msg))
@@ -123,128 +226,96 @@ class SimpleAgentLoop:
 
     def stop(self) -> None:
         self._running = False
+        for name, handle in self._mcp_handles.items():
+            asyncio.create_task(handle.aclose())
+            logger.info("MCP '%s': close requested", name)
 
     # ------------------------------------------------------------------
-    # WS 工具调用通知回调（供 SimpleAgentRunner 调用）
+    # WS 通知回调
     # ------------------------------------------------------------------
 
-    async def _on_tool_call(
-        self, chat_id: str, stream_id: int, tool_name: str, kwargs: dict[str, Any]
-    ) -> None:
-        """LLM 发起工具调用时通知前端。"""
+    async def _on_tool_call(self, chat_id: str, stream_id: int, tool_name: str, kwargs: dict) -> None:
         await self.bus.publish_outbound(OutboundMessage(
-            channel="websocket",
-            chat_id=chat_id,
-            content="",
-            metadata={
-                "_tool_call": True,
-                "_tool_name": tool_name,
-                "_stream_id": stream_id,
-            },
+            channel="websocket", chat_id=chat_id, content="",
+            metadata={"_tool_call": True, "_tool_name": tool_name, "_stream_id": stream_id},
         ))
 
-    async def _on_tool_result(
-        self, chat_id: str, stream_id: int, tool_name: str, result: str
-    ) -> None:
-        """工具执行完成后通知前端。"""
+    async def _on_tool_result(self, chat_id: str, stream_id: int, tool_name: str, result: str) -> None:
         await self.bus.publish_outbound(OutboundMessage(
-            channel="websocket",
-            chat_id=chat_id,
-            content="",
-            metadata={
-                "_tool_result": True,
-                "_tool_name": tool_name,
-                "_result": result[:200],  # 截断，避免 WS 消息过大
-                "_stream_id": stream_id,
-            },
+            channel="websocket", chat_id=chat_id, content="",
+            metadata={"_tool_result": True, "_tool_name": tool_name,
+                      "_result": result[:200], "_stream_id": stream_id},
         ))
 
     # ------------------------------------------------------------------
-    # Fake streaming helper
+    # Fake streaming
     # ------------------------------------------------------------------
 
-    async def _stream_text(
-        self, text: str, chat_id: str, stream_id: int
-    ) -> None:
-        """将文字切块以 fake streaming 方式发给前端。
-
-        效果与真实 streaming 相同：前端收到一系列 _stream_delta 事件，
-        文字逐步出现。无需额外 API 调用。
-        """
+    async def _stream_text(self, text: str, chat_id: str, stream_id: int) -> None:
         size = self._STREAM_CHUNK_SIZE
         for i in range(0, len(text), size):
-            chunk = text[i:i + size]
             await self.bus.publish_outbound(OutboundMessage(
-                channel="websocket",
-                chat_id=chat_id,
-                content=chunk,
+                channel="websocket", chat_id=chat_id, content=text[i:i+size],
                 metadata={"_stream_delta": True, "_stream_id": stream_id},
             ))
         await self.bus.publish_outbound(OutboundMessage(
-            channel="websocket",
-            chat_id=chat_id,
-            content="",
+            channel="websocket", chat_id=chat_id, content="",
             metadata={"_stream_delta": True, "_stream_end": True, "_stream_id": stream_id},
         ))
 
+    # ------------------------------------------------------------------
+    # 单轮处理（V2 核心：绑定 ActivatedToolSet）
+    # ------------------------------------------------------------------
+
     async def _handle_turn(self, msg: InboundMessage) -> None:
-        """处理一轮用户消息，返回 LLM 回复（含工具调用时走 Runner）。"""
-        chat_id = msg.chat_id
+        chat_id   = msg.chat_id
+        stream_id = id(msg)
+        t_start   = time.monotonic()
+
+        # 懒加载消息历史
         if chat_id not in self._sessions:
             messages, lc = self._store.load_history_smart(chat_id)
             self._sessions[chat_id] = messages
             self._last_consolidated[chat_id] = lc
-        history = self._sessions[chat_id]
+
+        # 懒加载 session metadata（V2）
+        if chat_id not in self._session_metadata:
+            self._session_metadata[chat_id] = self._store.read_session_metadata(chat_id)
+
+        history  = self._sessions[chat_id]
+        metadata = self._session_metadata[chat_id]
         history.append({"role": "user", "content": msg.content})
 
-        t_start = time.monotonic()
-        stream_id = id(msg)
-
-        # System prompt：从 SOUL.md 读取 Agent 身份，无文件时回落 _DEFAULT_SOUL 常量。
-        # MEMORY.md 有内容时追加"已记住的信息"段落。
-        soul = self._store.read_soul() or _DEFAULT_SOUL
+        soul   = self._store.read_soul() or _DEFAULT_SOUL
         memory = self._store.read_memory()
-        if memory:
-            system_content = f"{soul}\n\n## 你已经记住的信息\n{memory}"
-        else:
-            system_content = soul
+        system_content = f"{soul}\n\n## 你已经记住的信息\n{memory}" if memory else soul
+        messages_to_send = [{"role": "system", "content": system_content}, *history]
 
-        messages_to_send = [
-            {"role": "system", "content": system_content},
-            *history,
-        ]
+        # V2：构建本轮激活集，绑定到当前 task
+        activated_set = ActivatedToolSet.from_session(metadata)
 
-        # ------------------------------------------------------------------
-        # Phase 1：Runner 工具循环（非流式）
-        # ------------------------------------------------------------------
         try:
-            full_reply, updated_messages = await self._runner.run(
-                messages_to_send,
-                self._tools,
-                chat_id=chat_id,
-                stream_id=stream_id,
-            )
+            with use_activated_set(activated_set):
+                full_reply, updated_messages = await self._runner.run(
+                    messages_to_send,
+                    self._deferred_registry,
+                    chat_id=chat_id,
+                    stream_id=stream_id,
+                )
         except Exception as exc:
             logger.exception("Agent turn failed for chat_id=%s", chat_id)
             await self.bus.publish_outbound(OutboundMessage(
-                channel="websocket",
-                chat_id=chat_id,
-                content=str(exc),
-                metadata={"_user_error": True},
+                channel="websocket", chat_id=chat_id,
+                content=str(exc), metadata={"_user_error": True},
             ))
             if history and history[-1]["role"] == "user":
                 history.pop()
             return
 
-        # ------------------------------------------------------------------
-        # Phase 2：Fake streaming（把 final_reply 切块发给前端）
-        # ------------------------------------------------------------------
         await self._stream_text(full_reply, chat_id, stream_id)
 
-        # ------------------------------------------------------------------
-        # 提取工具链（若有），同步到 in-memory history
-        # ------------------------------------------------------------------
-        new_messages = updated_messages[len(messages_to_send):]  # tool chain (excl. system+history)
+        # 提取工具链，同步到 in-memory history
+        new_messages = updated_messages[len(messages_to_send):]
         tool_calls_msg: dict[str, Any] | None = None
         tool_results: list[dict[str, Any]] = []
         for m in new_messages:
@@ -252,25 +323,20 @@ class SimpleAgentLoop:
                 tool_calls_msg = m
             elif m.get("role") == "tool":
                 tool_results.append(m)
-
-        # 将工具链消息追加到 in-memory history，再加最终回复
         for m in new_messages:
             history.append(m)
         history.append({"role": "assistant", "content": full_reply})
 
-        # ------------------------------------------------------------------
-        # 持久化（原子写入）
-        # ------------------------------------------------------------------
+        # 持久化对话历史
         if tool_calls_msg and tool_results:
-            self._store.append_tool_turn(
-                chat_id, msg.content, tool_calls_msg, tool_results, full_reply
-            )
+            self._store.append_tool_turn(chat_id, msg.content, tool_calls_msg, tool_results, full_reply)
         else:
             self._store.append_turn(chat_id, msg.content, full_reply)
 
-        # ------------------------------------------------------------------
+        # V2：写回 session metadata（含 activated_tools）
+        self._store.write_session_metadata(chat_id, metadata)
+
         # 上下文压缩
-        # ------------------------------------------------------------------
         try:
             lc = await self._consolidator.maybe_consolidate(
                 chat_id, history,
@@ -278,13 +344,11 @@ class SimpleAgentLoop:
             )
             self._last_consolidated[chat_id] = lc
         except Exception:
-            logger.warning("Consolidator raised unexpectedly for chat_id=%s", chat_id, exc_info=True)
+            logger.warning("Consolidator raised for chat_id=%s", chat_id, exc_info=True)
 
         duration = time.monotonic() - t_start
         await self.bus.publish_outbound(OutboundMessage(
-            channel="websocket",
-            chat_id=chat_id,
-            content=full_reply,
+            channel="websocket", chat_id=chat_id, content=full_reply,
             metadata={"_turn_done": True, "_duration_sec": duration},
         ))
         logger.info(
