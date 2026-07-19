@@ -1,0 +1,85 @@
+# ===== AI / 工具配置 =====
+.agents/
+.claude/
+.codex/
+
+# ===== IDE =====
+.vscode/
+.idea/
+.vs/
+*.suo
+*.user
+*.swp
+*.swo
+*~
+
+# ===== Python =====
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.venv/
+venv/
+env/
+*.egg-info/
+*.egg
+.eggs/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.hypothesis/
+.tox/
+.nox/
+.pyre/
+.pytype/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+
+# ===== Node.js =====
+node_modules/
+.npm/
+.pnpm-store/
+.yarn/cache/
+
+# ===== 参考学习项目目录 =====
+/spore/
+
+# ===== 服务端运行时数据 =====
+# 对话历史（chat_id 子目录）、Dream cursor、MEMORY.md 是本地用户数据，不提交。
+# SOUL.md 是 Agent 人格配置，属于代码的一部分，应当提交。
+/server/memory/MEMORY.md
+/server/memory/.dream_cursor
+/server/memory/*/
+/server/logs/
+/server/tmp/
+/server/temp/
+/server/uploads/
+
+# OpenSpec 变更记录：仅归档目录纳入版本管理，未归档的属于个人工作区
+openspec/changes/*
+!openspec/changes/archive/
+
+# ===== 环境变量 =====
+.env
+.env.*
+!.env.example
+
+# ===== 日志 =====
+*.log
+logs/
+
+# ===== 临时文件 =====
+*.tmp
+*.temp
+*.bak
+*.pid
+*.pid.lock
+
+# ===== OS =====
+.DS_Store
+Thumbs.db
+desktop.ini
