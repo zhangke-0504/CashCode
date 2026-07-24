@@ -60,3 +60,6 @@ git commit -m "merge: $DEV_BRANCH ($DEV_SHA) into $MAIN_BRANCH (excluding $EXCLU
 echo ""
 echo "✅  合并完成！$EXCLUDE_DIR/ 未包含在本次合并中。"
 echo "    运行 'git push origin $MAIN_BRANCH' 推送到远程。"
+
+# bash scripts/merge-dev-to-main.sh
+# git push origin main
