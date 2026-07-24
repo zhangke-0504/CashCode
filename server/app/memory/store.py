@@ -481,6 +481,45 @@ class MemoryStore:
             if d.is_dir() and not d.name.startswith(".")
         ]
 
+    def list_sessions(self) -> list[dict[str, Any]]:
+        """扫描 base_dir，返回所有会话的摘要信息列表，按 updated_at 降序排序。
+
+        每个元素：{"chat_id": str, "title": str, "updated_at": str}
+        - title：取自 session_metadata.json 的 title 字段，缺失时为"新对话"
+        - updated_at：history.jsonl 的 mtime，文件不存在时用目录 mtime
+        """
+        if not self.base_dir.exists():
+            return []
+
+        sessions: list[dict[str, Any]] = []
+        for d in self.base_dir.iterdir():
+            if not d.is_dir() or d.name.startswith("."):
+                continue
+            chat_id = d.name
+
+            # 读取 metadata
+            meta = self.read_session_metadata(chat_id)
+            title: str = meta.get("title") or "新对话"
+
+            # updated_at：优先取 history.jsonl mtime
+            history_file = d / "history.jsonl"
+            if history_file.exists():
+                mtime = history_file.stat().st_mtime
+            else:
+                mtime = d.stat().st_mtime
+
+            import time as _time
+            updated_at = _time.strftime("%Y-%m-%dT%H:%M:%S", _time.localtime(mtime))
+
+            sessions.append({
+                "chat_id": chat_id,
+                "title": title,
+                "updated_at": updated_at,
+            })
+
+        sessions.sort(key=lambda s: s["updated_at"], reverse=True)
+        return sessions
+
     # ------------------------------------------------------------------
     # Session metadata（V2 新增：供 ActivatedToolSet 等跨轮次状态存储使用）
     # ------------------------------------------------------------------

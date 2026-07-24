@@ -284,6 +284,11 @@ class SimpleAgentLoop:
 
         history  = self._sessions[chat_id]
         metadata = self._session_metadata[chat_id]
+
+        # 第一轮时若无 title，自动截取用户消息前 40 字符作为默认标题
+        if not metadata.get("title"):
+            metadata["title"] = msg.content.strip()[:40] or "新对话"
+
         history.append({"role": "user", "content": msg.content})
 
         soul   = self._store.read_soul() or _DEFAULT_SOUL
