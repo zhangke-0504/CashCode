@@ -1,6 +1,6 @@
 # CashCode
 
-参考 spore 逐步复现的个人 AI Agent 框架，目标是理解并实践 spore 的核心架构。
+CashCode 是一个本地运行的个人 AI Agent 框架，支持跨会话持久记忆、MCP 工具体系和流式对话。
 
 ---
 
@@ -158,7 +158,7 @@ CashCode/
 
 ## 二、记忆体系
 
-记忆体系参考 spore 的三层设计，从短期到长期：
+记忆体系采用三层设计，从短期到长期：
 
 ```
 InboundMessage
@@ -308,7 +308,7 @@ class Tool(ABC):
 
 ## 五、MCP 体系
 
-CashCode 参考 spore 实现了完整的 MCP（Model Context Protocol）体系，支持将外部 MCP server 的工具无缝接入 Agent。
+CashCode 实现了完整的 MCP（Model Context Protocol）体系，支持将外部 MCP server 的工具无缝接入 Agent。
 
 ### 核心设计：延迟激活（Deferred Activation）
 
@@ -432,21 +432,6 @@ python mcp_servers/calculator/server.py
    → 直接调用，跳过 tool_search（激活集跨轮次持久化）
 ```
 
-### 与 spore 的对照
-
-| 功能 | spore | CashCode |
-|---|---|---|
-| 延迟激活 | ✓ DeferredAwareRegistry | ✓ 完整复现 |
-| BM25 工具搜索 | ✓ ToolSearchTool | ✓ 含 CJK bigram |
-| ActivatedToolSet | ✓ LRU + 持久化 | ✓ 完整复现 |
-| 磁盘缓存 | ✓ 含版本管理 | ✓ 简化版（fingerprint） |
-| stdio 传输 | ✓ | ✓ |
-| SSE 传输 | ✓ | ✓ |
-| streamableHttp | ✓ | 占位（未实现） |
-| MCPResourceWrapper | ✓ | ✗ |
-| 公司 catalog | ✓ | ✗（公司内网专用） |
-| LoginAuth | ✓ | ✗（公司内网专用） |
-
 ---
 
 ## 六、SOUL.md — Agent 人格配置
@@ -529,27 +514,25 @@ asyncio.run(test())
 
 ---
 
-## 参考
+## 八、前端界面
 
-本项目是对 [spore](https://github.com/spore-sh/spore) 核心架构的学习性复现，主要参考：
+前端位于 `client/` 目录，基于 Vite + React 19 + TypeScript + Tailwind v4。
 
-**记忆体系**
-- `spore/server/core/agent/memory.py` — MemoryStore / Consolidator / Dream
+### 启动前端（与后端并行运行）
 
-**Agent 循环**
-- `spore/server/core/agent/runner.py` — AgentRunner ReAct 循环
-- `spore/server/core/agent/loop.py` — AgentLoop 主循环
+```bash
+# 终端1：启动后端
+cd server && python main.py
 
-**工具体系**
-- `spore/server/core/agent/tools/` — 各类工具实现
-- `spore/server/core/agent/tools/registry.py` — ToolRegistry
+# 终端2：启动前端
+cd client && npm install && npm run dev
+# 浏览器访问: http://localhost:5173
+```
 
-**MCP 体系**
-- `spore/server/core/agent/tools/mcp.py` — MCPToolWrapper / establish_mcp_sessions
-- `spore/server/core/agent/tools/mcp_cache.py` — 工具 schema 磁盘缓存
-- `spore/server/core/agent/tools/tool_search.py` — ToolSearchTool / BM25 / DeferredAwareRegistry
-- `spore/server/core/agent/mcp_tool_activation.py` — ActivatedToolSet / ContextVar 绑定
-- `spore/server/app/api/mcp.py` — MCP server 管理 REST API
+### 前端功能
 
-**通信**
-- `spore/server/core/channels/websocket.py` — WebSocket 通道协议
+- 会话列表侧边栏（新建 / 重命名 / 删除）
+- 流式聊天消息（Markdown 渲染，含代码高亮和表格）
+- 工具调用进度显示（spinner → 结果预览）
+- WebSocket 自动重连
+- 深色主题

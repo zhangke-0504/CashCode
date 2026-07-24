@@ -27,6 +27,7 @@ from starlette.middleware.cors import CORSMiddleware
 import uvicorn
 
 from app.api import health
+from app.api.sessions import router as sessions_router
 from app.bus.queue import MessageBus
 from app.agent.loop import SimpleAgentLoop
 from app.ws.channel import WebSocketChannel
@@ -114,6 +115,7 @@ app.add_middleware(
 
 # 路由
 app.get("/api/health")(health)
+app.include_router(sessions_router, prefix="/api")
 
 
 if __name__ == "__main__":
