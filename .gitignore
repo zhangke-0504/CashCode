@@ -72,8 +72,8 @@ mcp_servers/*/data/
 # ===== 临时脚本 =====
 test_mcp.py
 
-# OpenSpec 变更记录（本地规划工具，不纳入版本管理）
-openspec/
+# OpenSpec 变更记录（本地规划工具，dev 分支追踪，main 分支不包含）
+# 注意：main 分支的 .gitignore 会覆盖这里保留 openspec/ 排除
 
 # ===== 环境变量 =====
 .env
