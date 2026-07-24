@@ -40,6 +40,21 @@ async def list_sessions() -> dict[str, Any]:
     return {"sessions": sessions}
 
 
+@router.get("/sessions/{chat_id}/messages")
+async def get_session_messages(chat_id: str) -> dict[str, Any]:
+    """Return persisted user and assistant messages for a session."""
+    chat_dir = _store.base_dir / chat_id
+    if not chat_dir.is_dir():
+        raise HTTPException(status_code=404, detail="session not found")
+
+    messages = [
+        {"role": message["role"], "content": message.get("content", "")}
+        for message in _store.load_history(chat_id)
+        if message.get("role") in ("user", "assistant")
+    ]
+    return {"chat_id": chat_id, "messages": messages}
+
+
 @router.patch("/sessions/{chat_id}")
 async def rename_session(chat_id: str, body: RenameRequest) -> dict[str, Any]:
     """重命名指定会话。"""

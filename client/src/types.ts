@@ -21,6 +21,11 @@ export interface Message {
   tool_calls?: ToolCallBlock[];
 }
 
+export interface PersistedMessage {
+  role: 'user' | 'assistant';
+  content: string;
+}
+
 export type WsConnectionState = 'connecting' | 'connected' | 'disconnected' | 'error';
 
 export type WsFrame =
