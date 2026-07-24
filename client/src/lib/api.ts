@@ -1,5 +1,5 @@
 // REST API wrappers for CashCode backend
-import type { Session } from '../types';
+import type { PersistedMessage, Session } from '../types';
 
 const BASE = 'http://127.0.0.1:8000/api';
 
@@ -19,6 +19,13 @@ async function apiRequest<T>(path: string, opts?: RequestInit): Promise<T> {
 export async function fetchSessions(): Promise<Session[]> {
   const data = await apiRequest<{ sessions: Session[] }>('/sessions');
   return data.sessions;
+}
+
+export async function fetchSessionMessages(chat_id: string): Promise<PersistedMessage[]> {
+  const data = await apiRequest<{ messages: PersistedMessage[] }>(
+    `/sessions/${encodeURIComponent(chat_id)}/messages`
+  );
+  return data.messages;
 }
 
 export async function renameSession(chat_id: string, title: string): Promise<void> {

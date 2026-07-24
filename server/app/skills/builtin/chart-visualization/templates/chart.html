@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Chart</title>
+  <style>html,body,#chart{width:100%;height:100%;margin:0}#error{display:none;padding:16px;color:#991b1b}</style>
+</head>
+<body>
+  <main id="chart" role="img" aria-label="Chart"></main>
+  <div id="error" role="alert">Failed to load the chart SDK.</div>
+  <script src="https://cdn.jsdelivr.net/npm/echarts@6.1.0/dist/echarts.min.js"></script>
+  <script>
+    const node = document.getElementById("chart");
+    if (!window.echarts) {
+      node.style.display = "none";
+      document.getElementById("error").style.display = "block";
+    } else {
+      const chart = echarts.init(node);
+      chart.setOption({title:{text:"Chart"},tooltip:{},xAxis:{data:[]},yAxis:{},series:[]});
+      window.addEventListener("resize", () => chart.resize());
+    }
+  </script>
+</body>
+</html>

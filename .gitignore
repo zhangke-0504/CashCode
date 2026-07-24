@@ -40,6 +40,12 @@ dist/
 coverage.xml
 htmlcov/
 
+# ===== 测试与人工验收产物 =====
+/server/tests/
+/server/test-results/
+/server/output/
+/.test-results/
+
 # ===== Node.js =====
 node_modules/
 .npm/
@@ -62,6 +68,7 @@ node_modules/
 /server/tmp/
 /server/temp/
 /server/uploads/
+/server/data/
 
 # MCP 运行时数据
 # mcp_cache：V2 工具 schema 磁盘缓存，运行时自动生成，不提交
@@ -72,8 +79,10 @@ mcp_servers/*/data/
 # ===== 临时脚本 =====
 test_mcp.py
 
-# OpenSpec 变更记录（本地规划工具，不纳入版本管理）
-openspec/
+# OpenSpec：dev 分支追踪归档目录（archive/）和主规范（specs/），不追踪未归档的 changes/
+# main 分支的 .gitignore 排除整个 openspec/
+openspec/changes/*
+!openspec/changes/archive/
 
 # ===== 环境变量 =====
 .env

@@ -223,6 +223,55 @@ class MemoryStore:
             chat_id, cursors[0], cursors[-1], len(tool_results),
         )
 
+    def append_traced_turn(
+        self,
+        chat_id: str,
+        user_content: str,
+        durable_messages: list[dict[str, Any]],
+        final_reply: str,
+    ) -> None:
+        """持久化一个完整工具调用 Turn 中的所有耐久消息。"""
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M")
+        payloads: list[dict[str, Any]] = [
+            {"role": "user", "content": user_content}
+        ]
+        for message in durable_messages:
+            role = message.get("role")
+            if role == "assistant" and message.get("tool_calls"):
+                payloads.append({
+                    "role": "tool_calls",
+                    "content": _tool_calls_summary(message),
+                    "tool_calls": message.get("tool_calls", []),
+                })
+            elif role == "assistant" and message.get("content"):
+                payloads.append({
+                    "role": "assistant",
+                    "content": message.get("content", ""),
+                })
+            elif role == "tool":
+                payloads.append({
+                    "role": "tool",
+                    "content": message.get("content", ""),
+                    "tool_call_id": message.get("tool_call_id", ""),
+                    "name": message.get("name", ""),
+                })
+        payloads.append({"role": "assistant", "content": final_reply})
+
+        first_cursor = self._next_cursor(chat_id)
+        records = []
+        for offset, payload in enumerate(payloads):
+            records.append({
+                "cursor": first_cursor + offset,
+                "timestamp": ts,
+                **payload,
+            })
+        history_file = self._history_file(chat_id)
+        with open(history_file, "a", encoding="utf-8") as handle:
+            handle.writelines(
+                json.dumps(record, ensure_ascii=False) + "\n" for record in records
+            )
+        self._write_cursor(chat_id, records[-1]["cursor"])
+
     # ------------------------------------------------------------------
     # 读取
     # ------------------------------------------------------------------
@@ -346,7 +395,7 @@ class MemoryStore:
                 last_summary_entry = e
 
         if last_summary_entry is None:
-            # 无 summary：全量加载，nothing is consolidated
+            # 没有 summary 时全量加载，此时尚未发生上下文压缩。
             messages: list[dict[str, Any]] = []
             for e in raw:
                 if e.get("role") == "summary":
@@ -401,11 +450,10 @@ class MemoryStore:
         return messages, 1
 
     def get_keep_from_cursor(self, chat_id: str, to_keep_count: int) -> int | None:
-        """Return the cursor of the first to_keep message in history.jsonl.
+        """返回 history.jsonl 中第一条待保留消息的 cursor。
 
-        Reads the last `to_keep_count` non-summary entries from the file.
-        Returns None if the file doesn't have enough entries or cursor is missing.
-        Used by the Consolidator to record keep_from_cursor in the summary record.
+        从文件末尾读取指定数量的非摘要记录；记录不足或缺少 cursor 时返回 None。
+        Consolidator 使用该值把 keep_from_cursor 写入摘要记录。
         """
         if to_keep_count <= 0:
             return None
@@ -578,14 +626,14 @@ class MemoryStore:
 
 
 # ---------------------------------------------------------------------------
-# Module-level helpers (used by MemoryStore methods and tests)
+# 模块级辅助函数，供 MemoryStore 方法和测试复用
 # ---------------------------------------------------------------------------
 
 def _entry_to_message(entry: dict[str, Any]) -> dict[str, Any] | None:
-    """Convert a raw history.jsonl entry to an OpenAI messages-format dict.
+    """把 history.jsonl 原始记录转换为 OpenAI messages 格式。
 
-    Returns None for entries that should be skipped (e.g. summary, unknown role).
-    Handles: user, assistant, tool_calls, tool.
+    对摘要或未知角色等应跳过的记录返回 None；支持 user、assistant、
+    tool_calls 和 tool 四种角色。
     """
     role = entry.get("role")
     content = entry.get("content", "")
@@ -597,7 +645,7 @@ def _entry_to_message(entry: dict[str, Any]) -> dict[str, Any] | None:
         return {"role": "assistant", "content": content}
 
     if role == "tool_calls":
-        # Restore assistant message that triggered tool calls
+        # 恢复发起工具调用的 assistant 消息。
         tool_calls = entry.get("tool_calls")
         if tool_calls:
             return {
@@ -613,16 +661,17 @@ def _entry_to_message(entry: dict[str, Any]) -> dict[str, Any] | None:
             return {
                 "role": "tool",
                 "tool_call_id": tool_call_id,
+                "name": entry.get("name", ""),
                 "content": content,
             }
         return None
 
-    # summary, unknown, etc. → skip
+    # 跳过 summary 和未知角色等记录。
     return None
 
 
 def _tool_calls_summary(tool_calls_msg: dict[str, Any]) -> str:
-    """Extract a human-readable summary of tool calls for the 'content' field."""
+    """为 content 字段生成便于阅读的工具调用摘要。"""
     calls = tool_calls_msg.get("tool_calls") or []
     names = [c.get("function", {}).get("name", "?") for c in calls if isinstance(c, dict)]
     return f"[TOOL_CALLS: {', '.join(names)}]" if names else "[TOOL_CALLS]"

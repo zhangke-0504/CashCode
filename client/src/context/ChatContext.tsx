@@ -8,7 +8,7 @@ import React, {
 import { v4 as uuid } from 'uuid';
 import type { Message, Session, ToolCallBlock, WsConnectionState, WsFrame } from '../types';
 import { useWebSocket } from '../hooks/useWebSocket';
-import { fetchSessions } from '../lib/api';
+import { fetchSessionMessages, fetchSessions } from '../lib/api';
 
 // ---------------------------------------------------------------------------
 // State shape
@@ -18,6 +18,7 @@ interface ChatState {
   activeSessionId: string | null;
   // messages per session: sessionId -> Message[]
   messages: Record<string, Message[]>;
+  loadedSessionIds: Record<string, boolean>;
   // whether the active session is streaming
   streaming: boolean;
   wsState: WsConnectionState;
@@ -28,6 +29,7 @@ const initialState: ChatState = {
   sessions: [],
   activeSessionId: null,
   messages: {},
+  loadedSessionIds: {},
   streaming: false,
   wsState: 'connecting',
   error: null,
@@ -43,6 +45,7 @@ type Action =
   | { type: 'SESSION_RENAMED'; chat_id: string; title: string }
   | { type: 'SESSION_DELETED'; chat_id: string }
   | { type: 'SWITCH_SESSION'; chat_id: string }
+  | { type: 'MESSAGES_LOADED'; chat_id: string; messages: Message[] }
   | { type: 'WS_READY'; chat_id: string }
   | { type: 'WS_ATTACHED'; chat_id: string }
   | { type: 'WS_DELTA'; chat_id: string; text: string }
@@ -75,6 +78,7 @@ function reducer(state: ChatState, action: Action): ChatState {
         ...state,
         sessions: exists ? state.sessions : [action.session, ...state.sessions],
         activeSessionId: action.session.chat_id,
+        loadedSessionIds: { ...state.loadedSessionIds, [action.session.chat_id]: true },
       };
     }
 
@@ -93,11 +97,25 @@ function reducer(state: ChatState, action: Action): ChatState {
           ? (remaining[0]?.chat_id ?? null)
           : state.activeSessionId;
       const { [action.chat_id]: _removed, ...msgs } = state.messages;
-      return { ...state, sessions: remaining, activeSessionId: nextActive, messages: msgs };
+      const { [action.chat_id]: _loaded, ...loadedSessionIds } = state.loadedSessionIds;
+      return {
+        ...state,
+        sessions: remaining,
+        activeSessionId: nextActive,
+        messages: msgs,
+        loadedSessionIds,
+      };
     }
 
     case 'SWITCH_SESSION':
       return { ...state, activeSessionId: action.chat_id, streaming: false, error: null };
+
+    case 'MESSAGES_LOADED':
+      return {
+        ...state,
+        messages: { ...state.messages, [action.chat_id]: action.messages },
+        loadedSessionIds: { ...state.loadedSessionIds, [action.chat_id]: true },
+      };
 
     case 'WS_READY': {
       // Server assigned a default chat_id on connection
@@ -107,6 +125,9 @@ function reducer(state: ChatState, action: Action): ChatState {
         ...state,
         sessions: exists ? state.sessions : [newSession, ...state.sessions],
         activeSessionId: state.activeSessionId ?? action.chat_id,
+        loadedSessionIds: exists
+          ? state.loadedSessionIds
+          : { ...state.loadedSessionIds, [action.chat_id]: true },
       };
     }
 
@@ -117,6 +138,9 @@ function reducer(state: ChatState, action: Action): ChatState {
         ...state,
         sessions: exists ? state.sessions : [newSession, ...state.sessions],
         activeSessionId: action.chat_id,
+        loadedSessionIds: exists
+          ? state.loadedSessionIds
+          : { ...state.loadedSessionIds, [action.chat_id]: true },
       };
     }
 
@@ -296,6 +320,31 @@ export function ChatProvider({ children }: { children: React.ReactNode }) {
   React.useEffect(() => {
     reloadSessions();
   }, [reloadSessions]);
+
+  // Load persisted history for the active session once. The cancellation flag
+  // prevents an obsolete request from committing after the session changed.
+  React.useEffect(() => {
+    const chatId = state.activeSessionId;
+    if (!chatId || state.loadedSessionIds[chatId]) return;
+
+    let cancelled = false;
+    fetchSessionMessages(chatId)
+      .then((messages) => {
+        if (cancelled) return;
+        dispatch({
+          type: 'MESSAGES_LOADED',
+          chat_id: chatId,
+          messages: messages.map((message) => ({ ...message, id: uuid() })),
+        });
+      })
+      .catch((e) => {
+        if (!cancelled) console.error('Failed to load session messages', e);
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [state.activeSessionId, state.loadedSessionIds]);
 
   return (
     <ChatContext.Provider value={{ state, send, dispatch, reloadSessions }}>

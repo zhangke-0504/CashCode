@@ -594,7 +594,7 @@ class MCPPrepareTool(Tool):
         return {
             "type": "object",
             "properties": {
-                "server_name": {"type": "string", "description": "mcp_config.json 中的 server key，如 'weather'"},
+                "server_name": {"type": "string", "description": "mcp_config.json 中的 server key，如 'test_stdio_mcp'"},
             },
             "required": ["server_name"],
         }

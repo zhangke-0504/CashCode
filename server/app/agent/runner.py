@@ -1,43 +1,38 @@
-# -*- coding: utf-8 -*-
-"""SimpleAgentRunner：非流式 ReAct 循环，处理工具调用阶段。
-
-参考 spore ``core.agent.runner.AgentRunner``，去掉收敛策略、工具审批、mid-turn 注入等
-复杂机制，保留最小可用的工具调用循环。
-
-执行策略：
-  - 所有轮次（含最终轮）均使用非流式 API
-  - 工具调用前后通过回调发布 WS 事件（_tool_call / _tool_result）
-  - 返回 (final_text, updated_messages)，loop.py 负责将 final_text 切块发给前端
-"""
+"""非流式 ReAct Runner，返回完整且按用途投影的 Turn 轨迹。"""
 from __future__ import annotations
 
 import json
 import logging
-from typing import Any, Callable, Awaitable
+from dataclasses import dataclass, field
+from typing import Any, Callable
 
 from openai import AsyncOpenAI
 
 from .tools.registry import ToolRegistry
+from .tools.result import ToolExecutionResult
 
 logger = logging.getLogger(__name__)
 
-# 工具调用轮次上限，防止无限循环
 _MAX_ITERATIONS = 5
 _MAX_ITERATIONS_MSG = (
-    "[系统提示] 已达到最大工具调用次数，请直接给出当前已知的最佳回复。"
+    "[System] The maximum tool-call iterations were reached. "
+    "Return the best answer available from the current evidence."
 )
 
 
+@dataclass(slots=True)
+class TurnTrace:
+    final_text: str
+    model_messages: list[dict[str, Any]] = field(default_factory=list)
+    durable_messages: list[dict[str, Any]] = field(default_factory=list)
+    tools_used: list[str] = field(default_factory=list)
+    iterations: int = 0
+    success: bool = True
+    error: str | None = None
+
+
 class SimpleAgentRunner:
-    """非流式 ReAct 循环。
-
-    Phase 1 专用：处理 LLM 的工具调用请求，直到 LLM 不再发起工具调用为止。
-    loop.py 收到返回的 final_text 后负责以分块方式流式发给用户（fake streaming）。
-
-    回调约定：
-      on_tool_call(chat_id, stream_id, tool_name, tool_args) → None（可 async）
-      on_tool_result(chat_id, stream_id, tool_name, result)  → None（可 async）
-    """
+    """循环执行模型和工具，直到模型返回最终文本。"""
 
     MAX_ITERATIONS: int = _MAX_ITERATIONS
 
@@ -53,10 +48,6 @@ class SimpleAgentRunner:
         self._on_tool_call = on_tool_call
         self._on_tool_result = on_tool_result
 
-    # ------------------------------------------------------------------
-    # 主入口
-    # ------------------------------------------------------------------
-
     async def run(
         self,
         messages: list[dict[str, Any]],
@@ -64,96 +55,105 @@ class SimpleAgentRunner:
         *,
         chat_id: str = "",
         stream_id: int = 0,
-    ) -> tuple[str, list[dict[str, Any]]]:
-        """执行 ReAct 循环，返回 (final_text, updated_messages)。
-
-        updated_messages 包含完整的工具调用链（tool_calls + tool_results + 最终回复），
-        供 loop.py 同步到 in-memory history 并持久化到 history.jsonl。
-
-        若 registry 为空或 LLM 直接返回文字，则 updated_messages == 原始 messages。
-        """
-        schemas = registry.get_definitions()
-        if not schemas:
-            # 无工具：直接非流式调用，返回文字
-            return await self._call_llm_text(messages), messages
-
+    ) -> TurnTrace:
         working = list(messages)
+        model_delta: list[dict[str, Any]] = []
+        durable_delta: list[dict[str, Any]] = []
+        tools_used: list[str] = []
+        had_tool_error = False
 
         for iteration in range(self.MAX_ITERATIONS):
-            response = await self._client.chat.completions.create(
-                model=self._model,
-                messages=working,
-                tools=schemas,
-                tool_choice="auto",
-                stream=False,
-            )
+            # tool_search、skill_load 或 mcp_prepare 执行后，可见工具可能发生变化。
+            schemas = registry.get_definitions()
+            kwargs: dict[str, Any] = {
+                "model": self._model,
+                "messages": working,
+                "stream": False,
+            }
+            if schemas:
+                kwargs.update(tools=schemas, tool_choice="auto")
+            response = await self._client.chat.completions.create(**kwargs)
 
             msg = response.choices[0].message
             tool_calls = msg.tool_calls
-
             if not tool_calls:
-                # 无工具调用：LLM 给出最终文字回复
                 final_text = msg.content or ""
-                logger.info(
-                    "Runner: done after %d iteration(s) for chat_id=%s",
-                    iteration + 1, chat_id,
+                return TurnTrace(
+                    final_text=final_text,
+                    model_messages=model_delta,
+                    durable_messages=durable_delta,
+                    tools_used=tools_used,
+                    iterations=iteration + 1,
+                    success=not had_tool_error,
+                    error="one or more tool calls failed" if had_tool_error else None,
                 )
-                return final_text, working
 
-            logger.info(
-                "Runner: iteration %d, %d tool call(s) for chat_id=%s",
-                iteration + 1, len(tool_calls), chat_id,
-            )
-
-            # 追加 assistant 消息（含 tool_calls）
-            assistant_dict = {
+            assistant_message = {
                 "role": "assistant",
                 "content": msg.content or "",
                 "tool_calls": [tc.model_dump() for tc in tool_calls],
             }
-            working.append(assistant_dict)
+            working.append(assistant_message)
+            model_delta.append(assistant_message)
+            durable_delta.append(dict(assistant_message))
 
-            # 逐一执行工具
             for call in tool_calls:
                 tool_name = call.function.name
+                tools_used.append(tool_name)
                 try:
                     raw_args = call.function.arguments
-                    kwargs = json.loads(raw_args) if raw_args else {}
+                    params = json.loads(raw_args) if raw_args else {}
+                    if not isinstance(params, dict):
+                        params = {}
                 except (json.JSONDecodeError, ValueError):
-                    kwargs = {}
+                    params = {}
 
-                # WS 通知：工具调用开始
-                await self._notify_tool_call(chat_id, stream_id, tool_name, kwargs)
+                await self._notify_tool_call(chat_id, stream_id, tool_name, params)
+                raw_result = await registry.execute(tool_name, params)
+                result = ToolExecutionResult.coerce(raw_result)
+                stripped_result = result.model_content.lstrip()
+                had_tool_error = had_tool_error or stripped_result.startswith("Error")
+                if stripped_result.startswith("{"):
+                    try:
+                        had_tool_error = had_tool_error or bool(json.loads(stripped_result).get("error"))
+                    except (json.JSONDecodeError, AttributeError):
+                        pass
+                await self._notify_tool_result(
+                    chat_id, stream_id, tool_name, result.public
+                )
 
-                # 通过 registry 执行工具（内置或 MCP 工具统一接口）
-                result = await registry.execute(tool_name, kwargs)
-
-                # WS 通知：工具执行完成
-                await self._notify_tool_result(chat_id, stream_id, tool_name, str(result))
-
-                # 追加工具结果消息
-                working.append({
+                model_message = {
                     "role": "tool",
                     "tool_call_id": call.id,
-                    "content": str(result),
-                })
+                    "name": tool_name,
+                    "content": result.model_content,
+                }
+                durable_message = {
+                    "role": "tool",
+                    "tool_call_id": call.id,
+                    "name": tool_name,
+                    "content": result.persisted,
+                }
+                working.append(model_message)
+                model_delta.append(model_message)
+                durable_delta.append(durable_message)
 
-        # 超出最大迭代次数：强制结束
         logger.warning("Runner: max iterations reached for chat_id=%s", chat_id)
         working.append({"role": "user", "content": _MAX_ITERATIONS_MSG})
         final_text = await self._call_llm_text(working)
-        return final_text, working
-
-    # ------------------------------------------------------------------
-    # 内部辅助
-    # ------------------------------------------------------------------
+        return TurnTrace(
+            final_text=final_text,
+            model_messages=model_delta,
+            durable_messages=durable_delta,
+            tools_used=tools_used,
+            iterations=self.MAX_ITERATIONS,
+            success=False,
+            error="maximum tool-call iterations reached",
+        )
 
     async def _call_llm_text(self, messages: list[dict[str, Any]]) -> str:
-        """非流式调用 LLM，只返回文字内容（无工具）。"""
         response = await self._client.chat.completions.create(
-            model=self._model,
-            messages=messages,
-            stream=False,
+            model=self._model, messages=messages, stream=False
         )
         return response.choices[0].message.content or ""
 
@@ -162,12 +162,12 @@ class SimpleAgentRunner:
         chat_id: str,
         stream_id: int,
         tool_name: str,
-        kwargs: dict[str, Any],
+        params: dict[str, Any],
     ) -> None:
         if self._on_tool_call:
-            result = self._on_tool_call(chat_id, stream_id, tool_name, kwargs)
-            if hasattr(result, "__await__"):
-                await result
+            value = self._on_tool_call(chat_id, stream_id, tool_name, params)
+            if hasattr(value, "__await__"):
+                await value
 
     async def _notify_tool_result(
         self,
@@ -177,6 +177,6 @@ class SimpleAgentRunner:
         result: str,
     ) -> None:
         if self._on_tool_result:
-            cb = self._on_tool_result(chat_id, stream_id, tool_name, result)
-            if hasattr(cb, "__await__"):
-                await cb
+            value = self._on_tool_result(chat_id, stream_id, tool_name, result)
+            if hasattr(value, "__await__"):
+                await value
