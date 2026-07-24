@@ -40,6 +40,12 @@ dist/
 coverage.xml
 htmlcov/
 
+# ===== 测试与人工验收产物 =====
+/server/tests/
+/server/test-results/
+/server/output/
+/.test-results/
+
 # ===== Node.js =====
 node_modules/
 .npm/
@@ -62,6 +68,7 @@ node_modules/
 /server/tmp/
 /server/temp/
 /server/uploads/
+/server/data/
 
 # MCP 运行时数据
 # mcp_cache：V2 工具 schema 磁盘缓存，运行时自动生成，不提交

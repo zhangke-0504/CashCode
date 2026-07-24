@@ -1,6 +1,6 @@
 # CashCode
 
-CashCode 是一个本地运行的个人 AI Agent 框架，支持跨会话持久记忆、MCP 工具体系和流式对话。
+CashCode 是一个本地运行的个人 AI Agent 框架，支持跨会话持久记忆、本地 Skill、MCP 工具体系和流式对话。
 
 ---
 
@@ -10,9 +10,10 @@ CashCode 是一个本地运行的个人 AI Agent 框架，支持跨会话持久�
 |---|---|
 | WebSocket 通信 | 流式对话、工具事件通知 |
 | 记忆体系 | 跨会话持久化、上下文压缩、长期记忆提炼 |
-| 工具调用 | ReAct 循环、10种内置工具 |
+| 工具调用 | ReAct 循环、内置工具与动态工具 |
 | Agent 人格 | SOUL.md 驱动的可配置身份 |
 | MCP 体系 | 延迟激活、BM25工具搜索、stdio/SSE双传输 |
+| Skill 体系 | 自然语言搜索、两阶段懒加载、Session 摘要、管理 API、自进化提案 |
 
 ---
 
@@ -32,8 +33,9 @@ CashCode 是一个本地运行的个人 AI Agent 框架，支持跨会话持久�
               │                               │
       ToolRegistry (内置)         DeferredAwareRegistry
       save_memory, web_fetch     (MCP 工具默认隐藏)
-      tool_search, mcp_prepare   ├── tool_search → 发现+激活
-              │                  └── mcp_prepare → 懒连接
+      skill_search/load/read     ├── tool_search → 发现 MCP 工具
+      tool_search, mcp_prepare   ├── mcp_prepare → 懒连接
+              │                  └── skill_search/load → 懒加载 Skill
               │
               ▼
     SimpleAgentRunner（ReAct 非流式循环）
@@ -73,6 +75,7 @@ CashCode/
 │   ├── main.py                    # FastAPI + WebSocket 服务入口
 │   ├── .env                       # 环境变量配置
 │   ├── requirements.txt
+│   ├── data/                      # Skill 与自进化运行数据（不提交 git）
 │   ├── memory/                    # 运行时记忆数据（不提交 git）
 │   │   ├── SOUL.md                # Agent 人格文件（提交 git）
 │   │   ├── MEMORY.md              # 全局长期记忆（运行时生成）
@@ -97,7 +100,13 @@ CashCode/
 │       │       ├── web.py         # WebFetchTool, WebSearchTool
 │       │       ├── filesystem.py  # ReadFileTool, WriteFileTool...
 │       │       ├── search.py      # GlobTool, GrepTool
-│       │       └── shell.py       # ExecTool
+│       │       ├── shell.py       # ExecTool
+│       │       └── result.py      # 工具结果的模型/前端/持久化投影
+│       ├── skills/                # Skill 目录、加载、管理和自进化实现
+│       │   └── builtin/           # 只读内置 Skill
+│       ├── api/
+│       │   ├── skills.py          # Skill 管理 API
+│       │   └── skill_evolution.py # Skill 自进化提案 API
 │       ├── memory/
 │       │   ├── store.py           # MemoryStore（含 session metadata）
 │       │   ├── consolidator.py    # 上下文压缩
@@ -109,13 +118,10 @@ CashCode/
 │           └── events.py          # InboundMessage, OutboundMessage
 ├── mcp_servers/                   # 本地 MCP mock servers
 │   ├── mcp_config.json            # MCP server 配置（stdio/SSE）
-│   ├── weather/
-│   │   └── server.py              # 天气查询（stdio，get_weather/get_forecast）
-│   ├── notes/
-│   │   ├── server.py              # 便签管理（stdio，create_note/list_notes）
-│   │   └── data/                  # 便签数据（不提交 git）
-│   └── calculator/
-│       └── server.py              # 计算器（SSE，calculate/convert_unit）
+│   ├── test_stdio_mcp/
+│   │   └── server.py              # stdio 测试服务（say_hello）
+│   └── test_sse_mcp/
+│       └── server.py              # SSE 测试服务（say_hello）
 ├── mcp_cache/                     # 工具 schema 磁盘缓存（不提交 git）
 └── openspec/                      # 变更管理
     ├── specs/                     # 主规范文档
@@ -306,7 +312,7 @@ class Tool(ABC):
 
 ---
 
-## 五、MCP 体系
+## 四、MCP 体系
 
 CashCode 实现了完整的 MCP（Model Context Protocol）体系，支持将外部 MCP server 的工具无缝接入 Agent。
 
@@ -316,20 +322,20 @@ CashCode 实现了完整的 MCP（Model Context Protocol）体系，支持将外
 
 ```
 LLM 默认只看到：                 MCP 工具默认隐藏：
-  tool_search  ← 搜索工具           mcp_weather_get_weather  ✗
-  mcp_prepare  ← 按需连接           mcp_notes_create_note    ✗
-  save_memory                        mcp_calculator_calculate ✗
+  tool_search  ← 搜索工具           mcp_test_stdio_mcp_say_hello ✗
+  mcp_prepare  ← 按需连接           mcp_test_sse_mcp_say_hello   ✗
+  save_memory
   web_fetch    ...
 
-用户问「北京天气？」
+用户要求「调用 stdio 测试 MCP」
     ↓
-LLM 调用 tool_search("天气")
-    ↓ BM25 搜索命中天气服务存根
-LLM 调用 mcp_prepare("weather")
+LLM 调用 tool_search("stdio Hello Cash")
+    ↓ BM25 搜索命中 stdio 测试服务存根
+LLM 调用 mcp_prepare("test_stdio_mcp")
     ↓ 建立 stdio 连接 → list_tools → 激活
-LLM 直接调用 mcp_weather_get_weather(city="北京")
+LLM 调用 mcp_test_stdio_mcp_say_hello()
     ↓
-返回结果（下次再问天气，直接调用，跳过搜索）
+返回 "Hello, Cash"（下次可直接调用，跳过搜索）
 ```
 
 ### 架构分层
@@ -373,39 +379,38 @@ LLM 直接调用 mcp_weather_get_weather(city="北京")
 
 | 传输 | 配置 | server 启动方式 | 典型场景 |
 |---|---|---|---|
-| **stdio** | `command + args` | CashCode 不自动 spawn；需 mcp_prepare 触发 | 本地命令行工具 |
+| **stdio** | `command + args` | 无需独立启动；`mcp_prepare` 时由 CashCode 拉起 | 本地命令行工具 |
 | **SSE** | `url` | 需**独立启动** HTTP 服务 | 公网 MCP 服务、第三方 API |
 
 ```json
 // mcp_servers/mcp_config.json
 {
-  "weather": {
+  "test_stdio_mcp": {
     "type": "stdio",
     "command": "python",
-    "args": ["mcp_servers/weather/server.py"],
-    "display_name": "天气服务",
-    "description": "查询城市天气和预报"
+    "args": ["mcp_servers/test_stdio_mcp/server.py"],
+    "display_name": "stdio 测试 MCP",
+    "description": "提供返回 Hello, Cash 的 say_hello 工具"
   },
-  "calculator": {
+  "test_sse_mcp": {
     "type": "sse",
     "url": "http://127.0.0.1:8090/sse",
-    "display_name": "计算器服务",
-    "description": "数学计算和单位换算（需先手动启动 server）"
+    "display_name": "SSE 测试 MCP",
+    "description": "提供返回 Hello, Cash 的 say_hello 工具；需要单独启动服务"
   }
 }
 ```
 
-### 本地 Mock MCP Servers
+### 本地测试 MCP 服务
 
 | Server | 传输 | 工具 | 启动方式 |
 |---|---|---|---|
-| `weather` | stdio | `get_weather(city)`, `get_forecast(city, days)` | mcp_prepare 自动 |
-| `notes` | stdio | `create_note(title, content)`, `list_notes()` | mcp_prepare 自动 |
-| `calculator` | SSE | `calculate(expression)`, `convert_unit(value, from, to)` | 需手动启动 |
+| `test_stdio_mcp` | stdio | `say_hello()` → `Hello, Cash` | `mcp_prepare` 自动拉起 |
+| `test_sse_mcp` | SSE | `say_hello()` → `Hello, Cash` | 需手动启动 |
 
 ```bash
 # 使用 SSE server 前需先启动（独立终端）
-python mcp_servers/calculator/server.py
+python mcp_servers/test_sse_mcp/server.py
 ```
 
 ### 完整会话流程
@@ -415,22 +420,127 @@ python mcp_servers/calculator/server.py
    → 读 mcp_config.json，不建任何连接
    → 有 disk cache 时，tool_search 可直接搜索（即使未连接）
 
-2. 用户问"帮我算 (123+456)*2"
-   → tool_search("计算 数学") 搜到 calculator 服务存根
-   → 提示"需先调用 mcp_prepare('calculator')"
+2. 用户要求调用 stdio 测试 MCP
+   → tool_search("stdio Hello Cash") 搜到 test_stdio_mcp 服务存根
+   → 提示需先调用 mcp_prepare("test_stdio_mcp")
 
-3. mcp_prepare("calculator")
-   → SSE 连接 http://127.0.0.1:8090/sse
+3. mcp_prepare("test_stdio_mcp")
+   → 启动 stdio 子进程
    → list_tools → 注册 MCPToolWrapper → write mcp_cache
-   → activate mcp_calculator_calculate + mcp_calculator_convert_unit
+   → activate mcp_test_stdio_mcp_say_hello
 
-4. mcp_calculator_calculate(expression="(123+456)*2")
-   → 返回 "1158"
+4. mcp_test_stdio_mcp_say_hello()
+   → 返回 "Hello, Cash"
 
-5. 下轮再问计算类问题
+5. 下轮再次调用该测试能力
    → DeferredAwareRegistry 发现工具已在 ActivatedToolSet
    → 直接调用，跳过 tool_search（激活集跨轮次持久化）
 ```
+
+---
+
+## 五、Skill 体系
+
+CashCode 在服务端提供本地 Skill 运行时。模型始终可见 `skill_search`、`skill_load` 和 `skill_read_resource`，但系统不会把所有已安装 Skill 的描述或正文一次性注入上下文。
+
+### 存储目录
+
+`CASHCODE_DATA_DIR` 默认指向 `server/data`，目录结构如下：
+
+```text
+skills/user/          用户管理的 Skill 包
+skills/agent/         审批通过后由 Agent 创建的 Skill 包
+skill-snapshots/      replace 和 rollback 使用的版本快照
+skill-evolution/      自进化证据与提案
+```
+
+内置 Skill 位于 `server/app/skills/builtin`，运行时只读。有效命名空间按 `builtin < user < agent` 处理，同名高优先级包会遮蔽低优先级包，并在目录元数据中暴露遮蔽来源。
+
+### Skill 包格式
+
+每个 Skill 是一个包含 `SKILL.md` 的目录，还可按需包含 `references/`、`templates/`、`scripts/` 和 `assets/`。目录名必须与 frontmatter 的 `name` 一致。
+
+```yaml
+---
+name: example-workflow
+description: 描述该能力以及应该在什么场景使用
+version: 1
+tags: [example]
+triggers: [example request]
+requires:
+  tools: [read_file]
+  mcp_servers: []
+  bins: []
+  env: []
+optional:
+  tools: []
+  mcp_servers: []
+---
+```
+
+加载器会校验 YAML 字段类型、名称、UTF-8 编码、文件大小、支持目录和路径边界，并拒绝绝对路径、`..` 穿越与逃逸包目录的符号链接。Skill 被加载时不会自动执行脚本、安装二进制、修改环境变量、进行认证或启动未声明的 MCP。
+
+### 搜索、加载与上下文生命周期
+
+自然语言调用采用两阶段懒加载：
+
+```text
+用户问题
+  → skill_search(query)        只搜索名称、描述、标签和触发词
+  → skill_load(exact_name)     校验后把完整 SKILL.md 注入当前 Turn
+  → skill_read_resource(...)   工作流需要时再读取单个支持文件
+  → 业务工具
+  → final content
+```
+
+消息开头可使用 `@name` 精确选择 Skill。`@name` 只跳过搜索，不会绕过 enabled 状态、格式、安全和依赖校验。完整 Skill 正文与支持文件只存在于当前 Turn；历史仅保存 `[Skill loaded: ...]` 和 `[Skill resource read: ...]` receipt。
+
+Session metadata 中的 `activated_skills` 是有界 LRU 摘要，只包含名称、简短描述、版本、内容 hash 和最后使用时间。后续 Turn 可看到近期 Skill 提示，但必须再次调用 `skill_load` 才能获得完整指令。Skill 被删除、禁用或 hash 变化后，旧摘要不会被当作已加载正文使用。
+
+### MCP 依赖联动
+
+`requires.mcp_servers` 中的必需 MCP 只在 `skill_load` 后通过现有懒连接机制准备，并在同一 Turn 的下一次 ReAct 迭代中暴露相应工具。`optional.mcp_servers` 只报告状态，不会在加载时连接。正文中出现但未在 frontmatter 声明的 `mcp_*` 名称不能触发连接或获得激活权限。
+
+### 管理 API
+
+服务提供以下 REST API：
+
+| API | 说明 |
+|---|---|
+| `GET/POST /api/skills` | 分页查询或创建 Skill |
+| `GET/PUT/DELETE /api/skills/{name}` | 查看、替换或删除 Skill |
+| `POST /api/skills/{name}/validate` | 重新校验 Skill 包 |
+| `PATCH /api/skills/{name}/enabled` | 启用或禁用可变 Skill |
+| `GET /api/skills/{name}/versions` | 查询版本快照 |
+| `POST /api/skills/{name}/rollback/{version}` | 原子回滚到指定版本 |
+
+内置 Skill 不允许修改。用户和 Agent Skill 的写操作统一经过名称、内容、路径、hash 前置条件和原子替换校验；替换及回滚前会保留快照。
+
+### Skill 自进化预览
+
+自进化默认关闭，可通过在server/.env中添加环境变量启用提案生成：
+
+```ini
+SKILL_EVOLUTION_ENABLED=true
+
+# 以下是默认值
+SKILL_EVOLUTION_MIN_TOOL_CALLS=2
+SKILL_EVOLUTION_RECURRENCE=2
+```
+
+一个 Turn 只有同时满足以下条件，才会成为自进化证据：
+
+- Evolution 已开启。
+- Turn 已成功完成并持久化。
+- 本轮至少调用 `SKILL_EVOLUTION_MIN_TOOL_CALLS` 次工具，默认至少 2 次。
+- 本轮没有工具调用错误。
+- 本轮没有达到 Runner 最大迭代次数。
+
+证据进入提案生成还需要满足重复门槛：具有相同流程指纹的证据至少出现 `SKILL_EVOLUTION_RECURRENCE` 次，默认至少 2 次。流程指纹由规范化后的用户输入和本轮使用的工具名称集合生成。
+
+符合条件的 Turn 只会贡献经过截断和脱敏的证据。重复门槛达到后，受限 Evolver 只能读取有界 Skill 摘要和 `skill-creator` 合约，并创建待审提案，不能直接访问通用文件系统、Shell、Web、MCP 或修改 Skill。
+
+提案通过 `/api/skill-evolution/proposals` 查询、审批或拒绝，永不自动应用。审批时会重新检查所有权、base hash 和完整包校验，只允许创建或修改 `agent` Skill，不能修改内置或用户 Skill；应用前会创建版本快照，之后可通过版本 API 回滚。
 
 ---
 
@@ -485,8 +595,8 @@ SSE server 需要独立启动（stdio server 不需要）：
 
 ```bash
 # 另开一个终端
-python mcp_servers/calculator/server.py
-# 启动后：Calculator SSE MCP server starting on http://127.0.0.1:8090/sse
+python mcp_servers/test_sse_mcp/server.py
+# 启动后：SSE 测试 MCP 已启动：http://127.0.0.1:8090/sse
 ```
 
 ### 测试连接
@@ -501,7 +611,7 @@ async def test():
         await ws.send(json.dumps({
             "type": "message",
             "chat_id": chat_id,
-            "content": "你好，帮我记住我叫张珂"
+            "content": "你好，帮我记住我叫Cash"
         }))
         async for msg in ws:
             data = json.loads(msg)

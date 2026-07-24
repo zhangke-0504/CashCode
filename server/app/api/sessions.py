@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import shutil
+import os
 from pathlib import Path
 from typing import Any
 
@@ -15,7 +16,10 @@ router = APIRouter()
 
 # 与 main.py 中 agent 共享同一个 MemoryStore 根目录。
 # 此处使用独立实例（只读/写 metadata，不影响 agent 内存缓存）。
-_store = MemoryStore(Path("memory"))
+_SERVER_ROOT = Path(__file__).resolve().parents[2]
+_store = MemoryStore(
+    Path(os.environ.get("MEMORY_DIR", str(_SERVER_ROOT / "memory"))).resolve()
+)
 
 
 class RenameRequest(BaseModel):

@@ -1,22 +1,15 @@
 {
-  "weather": {
+  "test_stdio_mcp": {
     "type": "stdio",
     "command": "python",
-    "args": ["mcp_servers/weather/server.py"],
-    "display_name": "天气服务",
-    "description": "查询城市天气和天气预报，支持 get_weather 和 get_forecast"
+    "args": ["mcp_servers/test_stdio_mcp/server.py"],
+    "display_name": "stdio 测试 MCP",
+    "description": "用于验证 stdio 延迟连接，提供返回 Hello, Cash 的 say_hello 工具"
   },
-  "notes": {
-    "type": "stdio",
-    "command": "python",
-    "args": ["mcp_servers/notes/server.py"],
-    "display_name": "便签服务",
-    "description": "创建和管理便签，支持 create_note 和 list_notes"
-  },
-  "calculator": {
+  "test_sse_mcp": {
     "type": "sse",
     "url": "http://127.0.0.1:8090/sse",
-    "display_name": "计算器服务",
-    "description": "数学计算和单位换算，支持 calculate 和 convert_unit。需先单独启动：python mcp_servers/calculator/server.py"
+    "display_name": "SSE 测试 MCP",
+    "description": "用于验证 SSE 延迟连接，提供返回 Hello, Cash 的 say_hello 工具；需要单独启动服务"
   }
 }

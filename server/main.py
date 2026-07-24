@@ -28,10 +28,15 @@ import uvicorn
 
 from app.api import health
 from app.api.sessions import router as sessions_router
+from app.api.skills import router as skills_router
+from app.api.skill_evolution import router as skill_evolution_router
 from app.bus.queue import MessageBus
 from app.agent.loop import SimpleAgentLoop
 from app.ws.channel import WebSocketChannel
 from app.memory.dream import SimpleDream
+from app.paths import DataPaths
+from app.skills.store import SkillStore
+from app.skills.evolution import EvolutionService
 
 
 # ---------------------------------------------------------------------------
@@ -70,8 +75,23 @@ async def lifespan(app: FastAPI):
     ws_host = os.environ.get("WS_HOST", "127.0.0.1")
     ws_port = int(os.environ.get("WS_PORT", "8765"))
 
+    paths = DataPaths.from_environment()
+    paths.ensure()
+    app.state.data_paths = paths
     bus = MessageBus()
-    agent = SimpleAgentLoop(bus)
+    agent = SimpleAgentLoop(bus, data_paths=paths)
+    app.state.skill_catalog = agent.skill_catalog
+    skill_store = SkillStore(agent.skill_catalog, paths.skill_snapshots)
+    app.state.skill_store = skill_store
+    evolution = EvolutionService(
+        agent._client,
+        agent._model,
+        agent.skill_catalog,
+        skill_store,
+        paths.skill_evolution,
+    )
+    app.state.skill_evolution = evolution
+    agent.set_skill_evolution(evolution)
     ws_channel = WebSocketChannel(bus, host=ws_host, port=ws_port)
     # Dream 复用 agent 的 client / model / store，无需额外初始化。
     dream = SimpleDream(agent._client, agent._model, agent._store)
@@ -88,6 +108,7 @@ async def lifespan(app: FastAPI):
         logger.info("Shutting down CashCode services...")
         if agent:
             agent.stop()
+        await evolution.close()
         if ws_channel:
             await ws_channel.stop()
         for task in (agent_task, ws_task, dream_task):
@@ -116,6 +137,8 @@ app.add_middleware(
 # 路由
 app.get("/api/health")(health)
 app.include_router(sessions_router, prefix="/api")
+app.include_router(skills_router, prefix="/api")
+app.include_router(skill_evolution_router, prefix="/api")
 
 
 if __name__ == "__main__":
