@@ -2,6 +2,7 @@ import type {
   CapabilitySelections,
   Message,
   McpSelectionReceipt,
+  LlmSelection,
   OutboundWsFrame,
   PersistedMessage,
   SkillSelectionReceipt,
@@ -136,25 +137,31 @@ export function filterCapabilities<T>(
   );
 }
 
-export function selectionMetadata(draft: SelectionDraft): CapabilitySelections | undefined {
+export function selectionMetadata(
+  draft: SelectionDraft,
+  llm: LlmSelection,
+): CapabilitySelections & { llm: LlmSelection } {
   const normalized = normalizeSelectionDraft(draft);
-  const metadata: CapabilitySelections = {};
+  const model = llm.model.trim();
+  if (!model || model.length > 256) throw new SelectionError('请选择有效模型');
+  const metadata: CapabilitySelections & { llm: LlmSelection } = {
+    llm: { provider: llm.provider, model },
+  };
   if (normalized.skills.length > 0) metadata.mentioned_skills = normalized.skills;
   if (normalized.mcps.length > 0) metadata.selected_mcp_connectors = normalized.mcps;
-  return Object.keys(metadata).length > 0 ? metadata : undefined;
+  return metadata;
 }
 
 export function buildMessageFrame(
   chatId: string,
   content: string,
   draft: SelectionDraft,
+  llm: LlmSelection,
 ): Extract<OutboundWsFrame, { type: 'message' }> {
   const trimmed = content.trim();
   if (!trimmed) throw new SelectionError('请输入消息内容');
-  const metadata = selectionMetadata(draft);
-  return metadata
-    ? { type: 'message', chat_id: chatId, content: trimmed, metadata }
-    : { type: 'message', chat_id: chatId, content: trimmed };
+  const metadata = selectionMetadata(draft, llm);
+  return { type: 'message', chat_id: chatId, content: trimmed, metadata };
 }
 
 export function movePickerIndex(

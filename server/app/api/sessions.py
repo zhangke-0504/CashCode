@@ -7,7 +7,7 @@ import os
 from pathlib import Path
 from typing import Any
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, field_validator
 
 from ..memory.store import MemoryStore
@@ -15,7 +15,7 @@ from ..memory.store import MemoryStore
 router = APIRouter()
 
 # 与 main.py 中 Agent 共享同一个 MemoryStore 根目录。
-# 此处使用独立实例，只读写会话元数据，不影响 Agent 的内存缓存。
+# 列表、消息和删除仍可直接访问文件；重命名必须通过 Agent 同步实时缓存。
 _SERVER_ROOT = Path(__file__).resolve().parents[2]
 _store = MemoryStore(
     Path(os.environ.get("MEMORY_DIR", str(_SERVER_ROOT / "memory"))).resolve()
@@ -53,17 +53,19 @@ async def get_session_messages(chat_id: str) -> dict[str, Any]:
 
 
 @router.patch("/sessions/{chat_id}")
-async def rename_session(chat_id: str, body: RenameRequest) -> dict[str, Any]:
+async def rename_session(
+    request: Request, chat_id: str, body: RenameRequest
+) -> dict[str, Any]:
     """重命名指定会话。"""
-    chat_dir = _store.base_dir / chat_id
-    if not chat_dir.exists():
+
+    agent = getattr(request.app.state, "agent", None)
+    if agent is None:
+        raise HTTPException(status_code=503, detail="agent unavailable")
+    try:
+        title = agent.rename_session(chat_id, body.title)
+    except FileNotFoundError:
         raise HTTPException(status_code=404, detail="session not found")
-
-    meta = _store.read_session_metadata(chat_id)
-    meta["title"] = body.title
-    _store.write_session_metadata(chat_id, meta)
-
-    return {"chat_id": chat_id, "title": body.title}
+    return {"chat_id": chat_id, "title": title}
 
 
 @router.delete("/sessions/{chat_id}", status_code=204)

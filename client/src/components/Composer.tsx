@@ -1,12 +1,14 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { Network, Send, Sparkles, Square, X } from 'lucide-react';
+import { Network, RefreshCw, Send, Sparkles, Square, X } from 'lucide-react';
 import { useChatContext } from '../context/ChatContext';
 import {
   ApiError,
+  fetchLlmModels,
   fetchSelectableMcpServers,
   fetchSelectableSkills,
 } from '../lib/api';
 import type { SelectableMcpServer } from '../lib/api';
+import { isChatGenerating } from '../lib/generation-state';
 import {
   addMcpSelection,
   addSkillSelection,
@@ -25,7 +27,7 @@ import type {
   PickerLevel,
   SelectionDraft,
 } from '../lib/selections';
-import type { SkillSummary } from '../types';
+import type { LlmModelsResponse, LlmProvider, LlmSelection, SkillSummary } from '../types';
 import { CapabilityPicker } from './CapabilityPicker';
 
 interface PickerState {
@@ -34,6 +36,32 @@ interface PickerState {
 }
 
 const emptySelections = (): SelectionDraft => ({ skills: [], mcps: [] });
+const MODEL_PREFERENCE_KEY = 'cashcode.llm.selection';
+const PROVIDER_LABELS: Record<LlmProvider, string> = {
+  openai_compatible: '通用 API',
+  ollama: 'Ollama',
+};
+
+function readModelPreference(): LlmSelection | null {
+  try {
+    const value = JSON.parse(localStorage.getItem(MODEL_PREFERENCE_KEY) ?? 'null') as Partial<LlmSelection> | null;
+    if (
+      value
+      && (value.provider === 'openai_compatible' || value.provider === 'ollama')
+      && typeof value.model === 'string'
+      && value.model.trim()
+    ) {
+      return { provider: value.provider, model: value.model.trim() };
+    }
+  } catch {
+    // Ignore malformed local preference state.
+  }
+  return null;
+}
+
+function modelOptionValue(selection: LlmSelection): string {
+  return JSON.stringify(selection);
+}
 
 function errorMessage(error: unknown): string {
   return error instanceof ApiError || error instanceof SelectionError
@@ -45,10 +73,15 @@ function errorMessage(error: unknown): string {
 
 export function Composer() {
   const { state, send, dispatch } = useChatContext();
-  const { activeSessionId, streaming } = state;
+  const { activeSessionId } = state;
+  const streaming = isChatGenerating(state.generatingByChat, activeSessionId);
   const [text, setText] = useState('');
   const [selections, setSelections] = useState<SelectionDraft>(emptySelections);
   const [selectionError, setSelectionError] = useState<string | null>(null);
+  const [modelCatalog, setModelCatalog] = useState<LlmModelsResponse | null>(null);
+  const [modelSelection, setModelSelection] = useState<LlmSelection | null>(readModelPreference);
+  const [modelsLoading, setModelsLoading] = useState(true);
+  const [modelsError, setModelsError] = useState<string | null>(null);
   const [picker, setPicker] = useState<PickerState | null>(null);
   const [skills, setSkills] = useState<SkillSummary[]>([]);
   const [mcps, setMcps] = useState<SelectableMcpServer[]>([]);
@@ -60,6 +93,40 @@ export function Composer() {
   const composerRef = useRef<HTMLDivElement>(null);
   const dismissedTriggerStart = useRef<number | null>(null);
   const pickerLevel = picker?.level;
+
+  const loadModels = useCallback(async () => {
+    setModelsLoading(true);
+    setModelsError(null);
+    try {
+      const catalog = await fetchLlmModels();
+      setModelCatalog(catalog);
+      setModelSelection((current) => {
+        const exists = (selection: LlmSelection) => catalog.models.some(
+          (item) => item.provider === selection.provider && item.id === selection.model,
+        );
+        if (current) return exists(current) ? current : null;
+        const first = catalog.models[0];
+        return first ? { provider: first.provider, model: first.id } : null;
+      });
+    } catch (error) {
+      setModelCatalog(null);
+      setModelsError(errorMessage(error));
+    } finally {
+      setModelsLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    void loadModels();
+  }, [loadModels]);
+
+  useEffect(() => {
+    if (modelSelection) {
+      localStorage.setItem(MODEL_PREFERENCE_KEY, JSON.stringify(modelSelection));
+    } else if (!modelsLoading) {
+      localStorage.removeItem(MODEL_PREFERENCE_KEY);
+    }
+  }, [modelSelection, modelsLoading]);
 
   const closePicker = useCallback((suppressTrigger = false) => {
     setPicker((current) => {
@@ -219,8 +286,12 @@ export function Composer() {
 
   const handleSubmit = () => {
     if (!activeSessionId || streaming) return;
+    if (!modelSelection) {
+      setSelectionError('请选择可用模型');
+      return;
+    }
     try {
-      const frame = buildMessageFrame(activeSessionId, text, selections);
+      const frame = buildMessageFrame(activeSessionId, text, selections, modelSelection);
       if (!send(frame)) {
         setSelectionError('连接尚未就绪，消息未发送');
         return;
@@ -268,6 +339,13 @@ export function Composer() {
       handleSubmit();
     }
   };
+
+  const providerErrors = modelCatalog
+    ? (Object.entries(modelCatalog.providers) as Array<[LlmProvider, LlmModelsResponse['providers'][LlmProvider]]>)
+      .filter(([, status]) => status.error)
+      .map(([provider, status]) => `${PROVIDER_LABELS[provider]}：${status.error}`)
+      .join('；')
+    : '';
 
   return (
     <div ref={composerRef} className="relative shrink-0 px-3 pb-3 pt-2 sm:px-4 sm:pb-4">
@@ -333,17 +411,54 @@ export function Composer() {
             className="flex-1 resize-none bg-transparent text-sm leading-relaxed text-zinc-200 outline-none placeholder:text-zinc-600 disabled:opacity-50"
             style={{ minHeight: '24px', maxHeight: '200px' }}
           />
-          {streaming ? (
-            <button onClick={handleStop} className="flex h-8 w-8 shrink-0 items-center justify-center rounded-md bg-red-500/20 text-red-400 transition-colors hover:bg-red-500/30" title="停止生成" aria-label="停止生成">
-              <Square className="h-3.5 w-3.5 fill-current" />
+          <div className="flex shrink-0 items-center gap-1.5">
+            <button type="button" onClick={() => void loadModels()} disabled={modelsLoading || streaming} className="flex h-8 w-8 shrink-0 items-center justify-center rounded-md text-zinc-500 transition-colors hover:bg-zinc-800 hover:text-zinc-200 disabled:opacity-40" title="刷新模型" aria-label="刷新模型">
+              <RefreshCw className={`h-3.5 w-3.5 ${modelsLoading ? 'animate-spin' : ''}`} />
             </button>
-          ) : (
-            <button onClick={handleSubmit} disabled={!text.trim() || !activeSessionId} className="flex h-8 w-8 shrink-0 items-center justify-center rounded-md bg-zinc-700 text-zinc-300 transition-colors hover:bg-zinc-600 disabled:cursor-not-allowed disabled:opacity-30" title="发送" aria-label="发送消息">
-              <Send className="h-3.5 w-3.5" />
-            </button>
-          )}
+            <select
+              value={modelSelection ? modelOptionValue(modelSelection) : ''}
+              onChange={(event) => {
+                if (!event.target.value) {
+                  setModelSelection(null);
+                  return;
+                }
+                const value = JSON.parse(event.target.value) as LlmSelection;
+                setModelSelection(value);
+                setSelectionError(null);
+              }}
+              disabled={modelsLoading || streaming || !modelCatalog?.models.length}
+              aria-label="选择模型"
+              title={modelSelection?.model ?? '选择模型'}
+              className="h-8 w-32 min-w-0 rounded-md border border-zinc-700 bg-zinc-950 px-2 text-xs text-zinc-300 outline-none focus:border-zinc-500 disabled:cursor-not-allowed disabled:opacity-50 sm:w-44"
+            >
+              <option value="">{modelsLoading ? '加载模型...' : '选择模型'}</option>
+              {(['openai_compatible', 'ollama'] as const).map((provider) => {
+                const models = modelCatalog?.models.filter((item) => item.provider === provider) ?? [];
+                return models.length > 0 ? (
+                  <optgroup key={provider} label={PROVIDER_LABELS[provider]}>
+                    {models.map((item) => (
+                      <option key={`${provider}:${item.id}`} value={modelOptionValue({ provider, model: item.id })}>
+                        {item.id}
+                      </option>
+                    ))}
+                  </optgroup>
+                ) : null;
+              })}
+            </select>
+            {streaming ? (
+              <button type="button" onClick={handleStop} className="flex h-8 w-8 shrink-0 items-center justify-center rounded-md bg-red-500/20 text-red-400 transition-colors hover:bg-red-500/30" title="停止生成" aria-label="停止生成">
+                <Square className="h-3.5 w-3.5 fill-current" />
+              </button>
+            ) : (
+              <button type="button" onClick={handleSubmit} disabled={!text.trim() || !activeSessionId || !modelSelection || modelsLoading} className="flex h-8 w-8 shrink-0 items-center justify-center rounded-md bg-zinc-700 text-zinc-300 transition-colors hover:bg-zinc-600 disabled:cursor-not-allowed disabled:opacity-30" title="发送" aria-label="发送消息">
+                <Send className="h-3.5 w-3.5" />
+              </button>
+            )}
+          </div>
         </div>
         {selectionError && <p role="alert" className="mt-2 break-words text-xs text-red-400">{selectionError}</p>}
+        {!selectionError && modelsError && <p role="alert" className="mt-2 break-words text-xs text-red-400">{modelsError}</p>}
+        {!selectionError && !modelsError && providerErrors && <p role="status" className="mt-2 truncate text-xs text-amber-400" title={providerErrors}>{providerErrors}</p>}
       </div>
     </div>
   );

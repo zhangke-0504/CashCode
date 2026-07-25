@@ -7,6 +7,7 @@ import { ChatView } from './components/ChatView';
 import { useChatContext } from './context/ChatContext';
 import { McpMarket } from './components/McpMarket';
 import { SkillMarket } from './components/SkillMarket';
+import { LlmSettings } from './components/LlmSettings';
 import { useState } from 'react';
 import type { AppView } from './types';
 
@@ -41,8 +42,10 @@ function AppLayout() {
             <ChatView />
           ) : activeView === 'mcp-market' ? (
             <McpMarket />
-          ) : (
+          ) : activeView === 'skill-market' ? (
             <SkillMarket />
+          ) : (
+            <LlmSettings />
           )}
         </main>
       </div>

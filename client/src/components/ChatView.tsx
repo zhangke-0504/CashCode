@@ -51,11 +51,7 @@ export function ChatView() {
     return (
       <div className="flex-1 flex flex-col">
         <div className="flex-1 flex flex-col items-center justify-center gap-6 pb-16">
-          <img src="/CashMe.png" alt="CashCode" className="w-40 h-40 object-contain opacity-90" />
-          <div className="text-center">
-            <h2 className="text-lg font-semibold text-zinc-200">你好，我是 CashCode</h2>
-            <p className="text-sm text-zinc-500 mt-1">有什么我可以帮你的？</p>
-          </div>
+          <img src="/CashLogo.png" alt="CashCode" className="w-40 h-40 object-contain opacity-90" />
         </div>
         <Composer />
       </div>

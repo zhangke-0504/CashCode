@@ -16,6 +16,14 @@ import type {
 } from '../types';
 import { useWebSocket } from '../hooks/useWebSocket';
 import { fetchSessionMessages, fetchSessions } from '../lib/api';
+import {
+  applyAttachedDraft,
+  applyLoadedSessions,
+  applyReadyDraft,
+  removeSession,
+  upsertSessionUpdate,
+} from '../lib/chat-session-state';
+import { setChatGenerating, type GenerationByChat } from '../lib/generation-state';
 import { normalizePersistedMessage, optimisticMessageFromFrame } from '../lib/selections';
 
 // ---------------------------------------------------------------------------
@@ -27,8 +35,7 @@ interface ChatState {
   // messages per session: sessionId -> Message[]
   messages: Record<string, Message[]>;
   loadedSessionIds: Record<string, boolean>;
-  // whether the active session is streaming
-  streaming: boolean;
+  generatingByChat: GenerationByChat;
   wsState: WsConnectionState;
   error: string | null;
 }
@@ -38,7 +45,7 @@ const initialState: ChatState = {
   activeSessionId: null,
   messages: {},
   loadedSessionIds: {},
-  streaming: false,
+  generatingByChat: {},
   wsState: 'connecting',
   error: null,
 };
@@ -56,12 +63,13 @@ type Action =
   | { type: 'MESSAGES_LOADED'; chat_id: string; messages: Message[] }
   | { type: 'WS_READY'; chat_id: string }
   | { type: 'WS_ATTACHED'; chat_id: string }
+  | { type: 'WS_SESSION_UPDATED'; session: Session }
   | { type: 'WS_DELTA'; chat_id: string; text: string }
   | { type: 'WS_STREAM_END'; chat_id: string }
   | { type: 'WS_DONE'; chat_id: string }
   | { type: 'WS_TOOL_CALL'; chat_id: string; tool_name: string; stream_id: number }
   | { type: 'WS_TOOL_RESULT'; chat_id: string; tool_name: string; result: string; stream_id: number }
-  | { type: 'WS_ERROR'; detail: string }
+  | { type: 'WS_ERROR'; detail: string; chat_id?: string }
   | { type: 'USER_MESSAGE_SENT'; frame: Extract<OutboundWsFrame, { type: 'message' }> };
 
 function ensureSession(messages: Record<string, Message[]>, id: string) {
@@ -76,8 +84,7 @@ function reducer(state: ChatState, action: Action): ChatState {
     case 'SESSIONS_LOADED':
       return {
         ...state,
-        sessions: action.sessions,
-        activeSessionId: state.activeSessionId ?? action.sessions[0]?.chat_id ?? null,
+        ...applyLoadedSessions(state, action.sessions),
       };
 
     case 'SESSION_ADDED': {
@@ -99,24 +106,19 @@ function reducer(state: ChatState, action: Action): ChatState {
       };
 
     case 'SESSION_DELETED': {
-      const remaining = state.sessions.filter((s) => s.chat_id !== action.chat_id);
-      const nextActive =
-        state.activeSessionId === action.chat_id
-          ? (remaining[0]?.chat_id ?? null)
-          : state.activeSessionId;
+      const sessionState = removeSession(state, action.chat_id);
       const { [action.chat_id]: _removed, ...msgs } = state.messages;
-      const { [action.chat_id]: _loaded, ...loadedSessionIds } = state.loadedSessionIds;
+      const generatingByChat = setChatGenerating(state.generatingByChat, action.chat_id, false);
       return {
         ...state,
-        sessions: remaining,
-        activeSessionId: nextActive,
+        ...sessionState,
         messages: msgs,
-        loadedSessionIds,
+        generatingByChat,
       };
     }
 
     case 'SWITCH_SESSION':
-      return { ...state, activeSessionId: action.chat_id, streaming: false, error: null };
+      return { ...state, activeSessionId: action.chat_id, error: null };
 
     case 'MESSAGES_LOADED':
       return {
@@ -126,38 +128,32 @@ function reducer(state: ChatState, action: Action): ChatState {
       };
 
     case 'WS_READY': {
-      // Server assigned a default chat_id on connection
-      const exists = state.sessions.find((s) => s.chat_id === action.chat_id);
-      const newSession: Session = { chat_id: action.chat_id, title: '新对话', updated_at: new Date().toISOString() };
       return {
         ...state,
-        sessions: exists ? state.sessions : [newSession, ...state.sessions],
-        activeSessionId: state.activeSessionId ?? action.chat_id,
-        loadedSessionIds: exists
-          ? state.loadedSessionIds
-          : { ...state.loadedSessionIds, [action.chat_id]: true },
+        ...applyReadyDraft(state, action.chat_id),
       };
     }
 
     case 'WS_ATTACHED': {
-      const exists = state.sessions.find((s) => s.chat_id === action.chat_id);
-      const newSession: Session = { chat_id: action.chat_id, title: '新对话', updated_at: new Date().toISOString() };
       return {
         ...state,
-        sessions: exists ? state.sessions : [newSession, ...state.sessions],
-        activeSessionId: action.chat_id,
-        loadedSessionIds: exists
-          ? state.loadedSessionIds
-          : { ...state.loadedSessionIds, [action.chat_id]: true },
+        ...applyAttachedDraft(state, action.chat_id),
       };
     }
+
+    case 'WS_SESSION_UPDATED':
+      return { ...state, ...upsertSessionUpdate(state, action.session) };
 
     case 'USER_MESSAGE_SENT': {
       const msg = optimisticMessageFromFrame(action.frame, uuid());
       const prev = ensureSession(state.messages, action.frame.chat_id);
       return {
         ...state,
-        streaming: true,
+        generatingByChat: setChatGenerating(
+          state.generatingByChat,
+          action.frame.chat_id,
+          true,
+        ),
         error: null,
         messages: { ...state.messages, [action.frame.chat_id]: [...prev, msg] },
       };
@@ -200,7 +196,10 @@ function reducer(state: ChatState, action: Action): ChatState {
     }
 
     case 'WS_DONE':
-      return { ...state, streaming: false };
+      return {
+        ...state,
+        generatingByChat: setChatGenerating(state.generatingByChat, action.chat_id, false),
+      };
 
     case 'WS_TOOL_CALL': {
       const prev = ensureSession(state.messages, action.chat_id);
@@ -250,8 +249,16 @@ function reducer(state: ChatState, action: Action): ChatState {
       return { ...state, messages: { ...state.messages, [action.chat_id]: updated } };
     }
 
-    case 'WS_ERROR':
-      return { ...state, error: action.detail, streaming: false };
+    case 'WS_ERROR': {
+      const chatId = action.chat_id ?? state.activeSessionId;
+      return {
+        ...state,
+        error: action.detail,
+        generatingByChat: chatId
+          ? setChatGenerating(state.generatingByChat, chatId, false)
+          : state.generatingByChat,
+      };
+    }
 
     default:
       return state;
@@ -284,6 +291,16 @@ export function ChatProvider({ children }: { children: React.ReactNode }) {
       case 'attached':
         dispatch({ type: 'WS_ATTACHED', chat_id: f.chat_id });
         break;
+      case 'session_updated':
+        dispatch({
+          type: 'WS_SESSION_UPDATED',
+          session: {
+            chat_id: f.chat_id,
+            title: f.title,
+            updated_at: f.updated_at,
+          },
+        });
+        break;
       case 'delta':
         dispatch({ type: 'WS_DELTA', chat_id: f.chat_id, text: f.text });
         break;
@@ -300,7 +317,7 @@ export function ChatProvider({ children }: { children: React.ReactNode }) {
         dispatch({ type: 'WS_TOOL_RESULT', chat_id: f.chat_id, tool_name: f.tool_name, result: f.result, stream_id: f.stream_id });
         break;
       case 'error':
-        dispatch({ type: 'WS_ERROR', detail: f.detail });
+        dispatch({ type: 'WS_ERROR', detail: f.detail, chat_id: f.chat_id });
         break;
     }
   }, []);

@@ -25,7 +25,6 @@ export function TitleBar({ wsState, onToggleSidebar }: TitleBarProps) {
       >
         <Menu className="h-4 w-4" />
       </button>
-      <img src="/CashLogo.png" alt="CashCode logo" className="w-6 h-6 object-contain" />
       <span className="text-sm font-semibold text-zinc-100 tracking-tight">CashCode</span>
       <div className="ml-auto flex items-center gap-1.5">
         <span className={`w-2 h-2 rounded-full ${stateColors[wsState]}`} title={wsState} />
