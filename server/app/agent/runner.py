@@ -6,8 +6,7 @@ import logging
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
-from openai import AsyncOpenAI
-
+from ..llm.runtime import LLMRuntime, LLMSnapshot
 from .tools.registry import ToolRegistry
 from .tools.result import ToolExecutionResult
 
@@ -38,13 +37,17 @@ class SimpleAgentRunner:
 
     def __init__(
         self,
-        client: AsyncOpenAI,
-        model: str,
+        runtime_or_client: LLMRuntime | Any,
+        model: str | None = None,
         on_tool_call: Callable[..., Any] | None = None,
         on_tool_result: Callable[..., Any] | None = None,
     ) -> None:
-        self._client = client
-        self._model = model
+        if isinstance(runtime_or_client, LLMRuntime):
+            self._runtime = runtime_or_client
+        else:
+            if not model:
+                raise ValueError("model is required when passing a client")
+            self._runtime = LLMRuntime.from_client(runtime_or_client, model)
         self._on_tool_call = on_tool_call
         self._on_tool_result = on_tool_result
 
@@ -55,6 +58,31 @@ class SimpleAgentRunner:
         *,
         chat_id: str = "",
         stream_id: int = 0,
+        provider: str | None = None,
+        model: str | None = None,
+    ) -> TurnTrace:
+        lease = (
+            self._runtime.acquire(provider, model)
+            if provider is not None and model is not None
+            else self._runtime.acquire_last()
+        )
+        async with lease as snapshot:
+            return await self._run_with_snapshot(
+                snapshot,
+                messages,
+                registry,
+                chat_id=chat_id,
+                stream_id=stream_id,
+            )
+
+    async def _run_with_snapshot(
+        self,
+        snapshot: LLMSnapshot,
+        messages: list[dict[str, Any]],
+        registry: ToolRegistry,
+        *,
+        chat_id: str,
+        stream_id: int,
     ) -> TurnTrace:
         working = list(messages)
         model_delta: list[dict[str, Any]] = []
@@ -66,13 +94,13 @@ class SimpleAgentRunner:
             # tool_search、skill_load 或 mcp_prepare 执行后，可见工具可能发生变化。
             schemas = registry.get_definitions()
             kwargs: dict[str, Any] = {
-                "model": self._model,
+                "model": snapshot.model,
                 "messages": working,
                 "stream": False,
             }
             if schemas:
                 kwargs.update(tools=schemas, tool_choice="auto")
-            response = await self._client.chat.completions.create(**kwargs)
+            response = await snapshot.client.chat.completions.create(**kwargs)
 
             msg = response.choices[0].message
             tool_calls = msg.tool_calls
@@ -142,7 +170,7 @@ class SimpleAgentRunner:
 
         logger.warning("Runner: max iterations reached for chat_id=%s", chat_id)
         working.append({"role": "user", "content": _MAX_ITERATIONS_MSG})
-        final_text = await self._call_llm_text(working)
+        final_text = await self._call_llm_text(snapshot, working)
         return TurnTrace(
             final_text=final_text,
             model_messages=model_delta,
@@ -153,9 +181,11 @@ class SimpleAgentRunner:
             error="maximum tool-call iterations reached",
         )
 
-    async def _call_llm_text(self, messages: list[dict[str, Any]]) -> str:
-        response = await self._client.chat.completions.create(
-            model=self._model, messages=messages, stream=False
+    async def _call_llm_text(
+        self, snapshot: LLMSnapshot, messages: list[dict[str, Any]]
+    ) -> str:
+        response = await snapshot.client.chat.completions.create(
+            model=snapshot.model, messages=messages, stream=False
         )
         return response.choices[0].message.content or ""
 

@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import type { WsConnectionState } from '../types';
 
-const WS_URL = 'ws://127.0.0.1:8765/';
+const WS_URL = import.meta.env?.VITE_WS_URL || 'ws://127.0.0.1:8765/';
 const MAX_RETRY_MS = 30000;
 
 export function useWebSocket(onFrame: (frame: unknown) => void) {

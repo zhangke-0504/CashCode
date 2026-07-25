@@ -16,6 +16,7 @@ import type {
 } from '../types';
 import { useWebSocket } from '../hooks/useWebSocket';
 import { fetchSessionMessages, fetchSessions } from '../lib/api';
+import { setChatGenerating, type GenerationByChat } from '../lib/generation-state';
 import { normalizePersistedMessage, optimisticMessageFromFrame } from '../lib/selections';
 
 // ---------------------------------------------------------------------------
@@ -27,8 +28,7 @@ interface ChatState {
   // messages per session: sessionId -> Message[]
   messages: Record<string, Message[]>;
   loadedSessionIds: Record<string, boolean>;
-  // whether the active session is streaming
-  streaming: boolean;
+  generatingByChat: GenerationByChat;
   wsState: WsConnectionState;
   error: string | null;
 }
@@ -38,7 +38,7 @@ const initialState: ChatState = {
   activeSessionId: null,
   messages: {},
   loadedSessionIds: {},
-  streaming: false,
+  generatingByChat: {},
   wsState: 'connecting',
   error: null,
 };
@@ -61,7 +61,7 @@ type Action =
   | { type: 'WS_DONE'; chat_id: string }
   | { type: 'WS_TOOL_CALL'; chat_id: string; tool_name: string; stream_id: number }
   | { type: 'WS_TOOL_RESULT'; chat_id: string; tool_name: string; result: string; stream_id: number }
-  | { type: 'WS_ERROR'; detail: string }
+  | { type: 'WS_ERROR'; detail: string; chat_id?: string }
   | { type: 'USER_MESSAGE_SENT'; frame: Extract<OutboundWsFrame, { type: 'message' }> };
 
 function ensureSession(messages: Record<string, Message[]>, id: string) {
@@ -106,17 +106,19 @@ function reducer(state: ChatState, action: Action): ChatState {
           : state.activeSessionId;
       const { [action.chat_id]: _removed, ...msgs } = state.messages;
       const { [action.chat_id]: _loaded, ...loadedSessionIds } = state.loadedSessionIds;
+      const generatingByChat = setChatGenerating(state.generatingByChat, action.chat_id, false);
       return {
         ...state,
         sessions: remaining,
         activeSessionId: nextActive,
         messages: msgs,
         loadedSessionIds,
+        generatingByChat,
       };
     }
 
     case 'SWITCH_SESSION':
-      return { ...state, activeSessionId: action.chat_id, streaming: false, error: null };
+      return { ...state, activeSessionId: action.chat_id, error: null };
 
     case 'MESSAGES_LOADED':
       return {
@@ -157,7 +159,11 @@ function reducer(state: ChatState, action: Action): ChatState {
       const prev = ensureSession(state.messages, action.frame.chat_id);
       return {
         ...state,
-        streaming: true,
+        generatingByChat: setChatGenerating(
+          state.generatingByChat,
+          action.frame.chat_id,
+          true,
+        ),
         error: null,
         messages: { ...state.messages, [action.frame.chat_id]: [...prev, msg] },
       };
@@ -200,7 +206,10 @@ function reducer(state: ChatState, action: Action): ChatState {
     }
 
     case 'WS_DONE':
-      return { ...state, streaming: false };
+      return {
+        ...state,
+        generatingByChat: setChatGenerating(state.generatingByChat, action.chat_id, false),
+      };
 
     case 'WS_TOOL_CALL': {
       const prev = ensureSession(state.messages, action.chat_id);
@@ -250,8 +259,16 @@ function reducer(state: ChatState, action: Action): ChatState {
       return { ...state, messages: { ...state.messages, [action.chat_id]: updated } };
     }
 
-    case 'WS_ERROR':
-      return { ...state, error: action.detail, streaming: false };
+    case 'WS_ERROR': {
+      const chatId = action.chat_id ?? state.activeSessionId;
+      return {
+        ...state,
+        error: action.detail,
+        generatingByChat: chatId
+          ? setChatGenerating(state.generatingByChat, chatId, false)
+          : state.generatingByChat,
+      };
+    }
 
     default:
       return state;
@@ -300,7 +317,7 @@ export function ChatProvider({ children }: { children: React.ReactNode }) {
         dispatch({ type: 'WS_TOOL_RESULT', chat_id: f.chat_id, tool_name: f.tool_name, result: f.result, stream_id: f.stream_id });
         break;
       case 'error':
-        dispatch({ type: 'WS_ERROR', detail: f.detail });
+        dispatch({ type: 'WS_ERROR', detail: f.detail, chat_id: f.chat_id });
         break;
     }
   }, []);

@@ -73,7 +73,7 @@ fake streaming → 前端
 CashCode/
 ├── server/
 │   ├── main.py                    # FastAPI + WebSocket 服务入口
-│   ├── .env                       # 环境变量配置
+│   ├── .env                       # 可选的非 LLM 环境变量配置
 │   ├── requirements.txt
 │   ├── data/                      # Skill、用户 MCP 与自进化运行数据（不提交 git）
 │   │   ├── mcp/servers.json       # 用户创建的 SSE MCP 配置
@@ -613,21 +613,40 @@ SKILL_EVOLUTION_RECURRENCE=2
 ```bash
 cd server
 pip install -r requirements.txt
-cp .env.example .env  # 填入 DEEPSEEK_API_KEY
 ```
 
-### 配置（server/.env）
+### LLM 配置
+
+后端不要求预先创建 `.env`，也会在尚未配置模型服务时正常启动。启动前后端后，在左侧栏底部打开 `设置` → `LLM 设置`，保存连接信息：
+
+- `通用 API`：API Base URL 和 API Key，支持 OpenAI-compatible 接口。
+- `Ollama`：Ollama 服务地址，例如 `http://127.0.0.1:11434`。
+
+模型不在设置页激活或保存。返回对话页后，在发送箭头左侧的模型列表中选择本轮使用的模型；列表会分别发现已配置的通用 API 和 Ollama 模型。每条消息携带自己的提供方和模型选择，切换模型不会修改密钥配置。
+
+首次有效保存时，CashCode 会自动创建仅供当前用户使用的 `settings/llm.json`。默认文件位于 Git 工作区之外：
+
+- Windows：`%LOCALAPPDATA%\CashCode\settings\llm.json`
+- macOS：`~/Library/Application Support/CashCode/settings/llm.json`
+- Linux：`$XDG_CONFIG_HOME/cashcode/settings/llm.json`，未设置 XDG 时使用 `~/.config/cashcode/settings/llm.json`
+
+API 查询不会返回已保存的密钥。测试或受管部署可以通过 `CASHCODE_CONFIG_DIR` 指定配置根目录；若将其指向项目内的 `server/data`，该目录及 LLM 密钥 fallback 已被 `.gitignore` 排除。
+
+旧版本用户在新配置文件不存在时，现有 `DEEPSEEK_API_KEY` 和 `DEEPSEEK_API_BASE` 会被一次性迁移到新文件；`DEEPSEEK_MODEL` 不再迁移，因为模型由对话输入框选择。迁移不会修改 `.env`；新文件创建后，LLM 配置不再读取这些旧变量。
+
+### 可选运行配置
+
+以下非 LLM 参数可以通过进程环境或可选的 `server/.env` 覆盖；不配置时均使用默认值：
 
 ```ini
-DEEPSEEK_API_KEY=your_key_here
-DEEPSEEK_API_BASE=https://api.deepseek.com
-DEEPSEEK_MODEL= deepseek-v4-flash
-
 WS_HOST=127.0.0.1
 WS_PORT=8765
+CASHCODE_ALLOWED_ORIGINS=http://127.0.0.1:5173,http://localhost:5173
 
 # 文件系统工具和 exec 工具的工作目录（默认为服务启动目录）
 # WORKSPACE_DIR=/your/workspace/path
+# CASHCODE_DATA_DIR=/your/runtime/data/path
+# CASHCODE_CONFIG_DIR=/your/private/config/path
 ```
 
 ### 启动服务

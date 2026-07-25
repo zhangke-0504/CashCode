@@ -10,11 +10,11 @@ import time
 from pathlib import Path
 from typing import Any
 
-from openai import AsyncOpenAI
-
 from ..bus.events import InboundMessage, OutboundMessage
+from ..llm.models import LLMNotConfiguredError
+from ..llm.runtime import LLMRuntime
 from ..bus.queue import MessageBus
-from ..memory.consolidator import SimpleConsolidator
+from ..memory.consolidator import ConsolidationPlan, SimpleConsolidator
 from ..memory.store import MemoryStore
 from ..paths import DataPaths
 from ..skills.activation import ActivatedSkillSet, TurnSkillContext, use_skill_context
@@ -67,6 +67,7 @@ class SimpleAgentLoop:
         data_paths: DataPaths | None = None,
         skill_catalog: SkillCatalog | None = None,
         skill_store: SkillStore | None = None,
+        llm_runtime: LLMRuntime | None = None,
     ) -> None:
         self.bus = bus
         self._sessions: dict[str, list[dict[str, Any]]] = {}
@@ -74,7 +75,9 @@ class SimpleAgentLoop:
         self._session_metadata: dict[str, dict[str, Any]] = {}
         self._turn_locks: dict[str, asyncio.Lock] = {}
         self._turn_lock_users: dict[str, int] = {}
-        self._turn_tasks: set[asyncio.Task] = set()
+        self._turn_tasks: set[asyncio.Task[Any]] = set()
+        self._auxiliary_tasks: set[asyncio.Task[Any]] = set()
+        self._consolidation_tasks: dict[str, asyncio.Task[Any]] = {}
 
         server_root = Path(__file__).resolve().parents[2]
         memory_root = Path(os.environ.get("MEMORY_DIR", str(server_root / "memory"))).resolve()
@@ -83,13 +86,8 @@ class SimpleAgentLoop:
         self._data_paths = data_paths or DataPaths.from_environment()
         self._data_paths.ensure()
 
-        api_key = os.environ.get("DEEPSEEK_API_KEY", "")
-        api_base = os.environ.get("DEEPSEEK_API_BASE", "https://api.deepseek.com")
-        self._model = os.environ.get("DEEPSEEK_MODEL", "deepseek-chat")
-        if not api_key:
-            raise RuntimeError("DEEPSEEK_API_KEY not set; add it to server/.env")
-        self._client = AsyncOpenAI(api_key=api_key, base_url=api_base)
-        self._consolidator = SimpleConsolidator(self._client, self._model, self._store)
+        self._llm_runtime = llm_runtime or LLMRuntime()
+        self._consolidator = SimpleConsolidator(self._llm_runtime, self._store)
 
         self._registry = ToolRegistry()
         for tool in (
@@ -156,8 +154,7 @@ class SimpleAgentLoop:
         self._deferred_registry.register(SkillReadResourceTool(self._skill_catalog))
 
         self._runner = SimpleAgentRunner(
-            self._client,
-            self._model,
+            self._llm_runtime,
             on_tool_call=self._on_tool_call,
             on_tool_result=self._on_tool_result,
         )
@@ -171,6 +168,10 @@ class SimpleAgentLoop:
     @property
     def skill_store(self) -> SkillStore:
         return self._skill_store
+
+    @property
+    def llm_runtime(self) -> LLMRuntime:
+        return self._llm_runtime
 
     def set_skill_evolution(self, service: Any) -> None:
         self._skill_evolution = service
@@ -457,7 +458,10 @@ class SimpleAgentLoop:
     async def run(self) -> None:
         self._running = True
         await self._setup_mcp()
-        logger.info("SimpleAgentLoop started (model=%s, MCP=lazy, Skills=lazy)", self._model)
+        logger.info(
+            "SimpleAgentLoop started (LLM=%s, MCP=lazy, Skills=lazy)",
+            "configured" if self._llm_runtime.configured else "unconfigured",
+        )
         try:
             while self._running:
                 try:
@@ -471,11 +475,120 @@ class SimpleAgentLoop:
             pass
         finally:
             self._running = False
+            await self._cancel_owned_tasks()
 
     def stop(self) -> None:
         self._running = False
+        for task in (*self._turn_tasks, *self._auxiliary_tasks):
+            task.cancel()
         for handle in self._mcp_handles.values():
             asyncio.create_task(handle.aclose())
+
+    async def _cancel_owned_tasks(self) -> None:
+        current = asyncio.current_task()
+        tasks = [
+            task
+            for task in (*self._turn_tasks, *self._auxiliary_tasks)
+            if task is not current and not task.done()
+        ]
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+    def _release_turn_lock(self, chat_id: str, lock: asyncio.Lock) -> None:
+        remaining = self._turn_lock_users.get(chat_id, 1) - 1
+        if remaining <= 0:
+            self._turn_lock_users.pop(chat_id, None)
+            if self._turn_locks.get(chat_id) is lock:
+                self._turn_locks.pop(chat_id, None)
+        else:
+            self._turn_lock_users[chat_id] = remaining
+
+    async def _run_consolidation(
+        self,
+        plan: ConsolidationPlan,
+        *,
+        provider: str,
+        model: str,
+        lock: asyncio.Lock,
+    ) -> None:
+        completed = await self._consolidator.consolidate(
+            plan,
+            provider=provider,
+            model=model,
+        )
+        if not completed:
+            return
+
+        async with lock:
+            history, last_consolidated = self._store.load_history_smart(plan.chat_id)
+            if not last_consolidated:
+                logger.warning(
+                    "Consolidator: persisted summary could not be reloaded for chat_id=%s",
+                    plan.chat_id,
+                )
+                return
+            current = self._sessions.get(plan.chat_id)
+            if current is not None:
+                current.clear()
+                current.extend(history)
+            self._last_consolidated[plan.chat_id] = last_consolidated
+
+    def _schedule_consolidation(
+        self,
+        chat_id: str,
+        history: list[dict[str, Any]],
+        *,
+        provider: str,
+        model: str,
+    ) -> None:
+        existing = self._consolidation_tasks.get(chat_id)
+        if existing is not None and not existing.done():
+            logger.debug("Consolidator: already running for chat_id=%s", chat_id)
+            return
+
+        try:
+            plan = self._consolidator.prepare(chat_id, history)
+        except Exception:
+            logger.warning(
+                "Consolidator: failed to prepare chat_id=%s",
+                chat_id,
+                exc_info=True,
+            )
+            return
+        if plan is None:
+            return
+
+        lock = self._turn_locks[chat_id]
+        self._turn_lock_users[chat_id] = self._turn_lock_users.get(chat_id, 0) + 1
+        task = asyncio.create_task(
+            self._run_consolidation(
+                plan,
+                provider=provider,
+                model=model,
+                lock=lock,
+            )
+        )
+        self._auxiliary_tasks.add(task)
+        self._consolidation_tasks[chat_id] = task
+
+        def finish(completed: asyncio.Task[Any]) -> None:
+            self._auxiliary_tasks.discard(completed)
+            if self._consolidation_tasks.get(chat_id) is completed:
+                self._consolidation_tasks.pop(chat_id, None)
+            self._release_turn_lock(chat_id, lock)
+            if completed.cancelled():
+                return
+            error = completed.exception()
+            if error is not None:
+                logger.warning(
+                    "Consolidator: background task failed for chat_id=%s",
+                    chat_id,
+                    exc_info=(type(error), error, error.__traceback__),
+                )
+
+        task.add_done_callback(finish)
 
     async def _on_tool_call(
         self, chat_id: str, stream_id: int, tool_name: str, params: dict[str, Any]
@@ -525,18 +638,27 @@ class SimpleAgentLoop:
             async with lock:
                 await self._handle_turn_locked(message)
         finally:
-            remaining = self._turn_lock_users.get(chat_id, 1) - 1
-            if remaining <= 0:
-                self._turn_lock_users.pop(chat_id, None)
-                if self._turn_locks.get(chat_id) is lock:
-                    self._turn_locks.pop(chat_id, None)
-            else:
-                self._turn_lock_users[chat_id] = remaining
+            self._release_turn_lock(chat_id, lock)
 
     async def _handle_turn_locked(self, message: InboundMessage) -> None:
         chat_id = message.chat_id
         stream_id = id(message)
         started = time.monotonic()
+        llm_selection = message.metadata.get("llm")
+        provider = llm_selection.get("provider") if isinstance(llm_selection, dict) else None
+        model = llm_selection.get("model") if isinstance(llm_selection, dict) else None
+        if (
+            not isinstance(provider, str)
+            or not isinstance(model, str)
+            or not self._llm_runtime.has_provider(provider)
+        ):
+            await self.bus.publish_outbound(OutboundMessage(
+                channel="websocket",
+                chat_id=chat_id,
+                content=str(LLMNotConfiguredError(provider)),
+                metadata={"_user_error": True},
+            ))
+            return
         if chat_id not in self._sessions:
             history, last_consolidated = self._store.load_history_smart(chat_id)
             self._sessions[chat_id] = history
@@ -646,6 +768,8 @@ class SimpleAgentLoop:
                         self._deferred_registry,
                         chat_id=chat_id,
                         stream_id=stream_id,
+                        provider=provider,
+                        model=model,
                     )
                 if explicit_receipts:
                     trace.durable_messages[0:0] = explicit_receipts
@@ -689,17 +813,9 @@ class SimpleAgentLoop:
                 tools_used=trace.tools_used,
                 durable_messages=trace.durable_messages,
                 persisted=trace.success,
+                provider=provider,
+                model=model,
             )
-
-        try:
-            value = await self._consolidator.maybe_consolidate(
-                chat_id,
-                history,
-                last_consolidated=self._last_consolidated.get(chat_id, 0),
-            )
-            self._last_consolidated[chat_id] = value
-        except Exception:
-            logger.warning("Consolidator failed for chat_id=%s", chat_id, exc_info=True)
 
         duration = time.monotonic() - started
         await self.bus.publish_outbound(OutboundMessage(
@@ -714,4 +830,10 @@ class SimpleAgentLoop:
             duration,
             len(trace.final_text),
             len(trace.tools_used),
+        )
+        self._schedule_consolidation(
+            chat_id,
+            history,
+            provider=provider,
+            model=model,
         )

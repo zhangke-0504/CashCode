@@ -5,8 +5,11 @@ from __future__ import annotations
 import re
 from typing import Any
 
+from .llm.models import PROVIDERS
+
 MAX_CAPABILITY_SELECTIONS = 8
 MAX_SELECTION_LABEL = 100
+MAX_MODEL_ID = 256
 
 _SKILL_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
 _MCP_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
@@ -68,15 +71,39 @@ def _sanitize_rows(
     return rows
 
 
-def sanitize_selection_metadata(raw: Any) -> dict[str, list[dict[str, str]]]:
+def _sanitize_llm_selection(raw: Any, *, required: bool) -> dict[str, str] | None:
+    if raw is None:
+        if required:
+            raise SelectionValidationError("llm selection is required")
+        return None
+    if not isinstance(raw, dict):
+        raise SelectionValidationError("llm must be an object")
+    provider = raw.get("provider")
+    model = raw.get("model")
+    if not isinstance(provider, str) or provider not in PROVIDERS:
+        raise SelectionValidationError("llm.provider is invalid")
+    if not isinstance(model, str):
+        raise SelectionValidationError("llm.model must be a string")
+    model = model.strip()
+    if not model or len(model) > MAX_MODEL_ID or "\x00" in model:
+        raise SelectionValidationError("llm.model is invalid")
+    return {"provider": provider, "model": model}
+
+
+def sanitize_selection_metadata(
+    raw: Any, *, require_llm: bool = False
+) -> dict[str, Any]:
     """把不可信 WebSocket metadata 投影为有界的规范选择结构。"""
 
     if raw is None:
+        if require_llm:
+            raise SelectionValidationError("llm selection is required")
         return {}
     if not isinstance(raw, dict):
         raise SelectionValidationError("metadata must be an object")
     skills_raw = raw.get("mentioned_skills")
     mcp_raw = raw.get("selected_mcp_connectors")
+    llm = _sanitize_llm_selection(raw.get("llm"), required=require_llm)
     # 在去重前限制原始条目数，防止重复记录绕过请求体上限。
     raw_count = (
         len(skills_raw) if isinstance(skills_raw, list) else 0
@@ -97,11 +124,13 @@ def sanitize_selection_metadata(raw: Any) -> dict[str, list[dict[str, str]]]:
         identity_field="server",
         pattern=_MCP_NAME_RE,
     )
-    result: dict[str, list[dict[str, str]]] = {}
+    result: dict[str, Any] = {}
     if skills:
         result["mentioned_skills"] = skills
     if connectors:
         result["selected_mcp_connectors"] = connectors
+    if llm:
+        result["llm"] = llm
     return result
 
 

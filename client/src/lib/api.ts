@@ -4,6 +4,11 @@ import type {
   McpServerCreate,
   McpServerUpdate,
   McpToolsResponse,
+  LlmConnectionTestRequest,
+  LlmConnectionTestResult,
+  LlmModelsResponse,
+  LlmSettings,
+  LlmSettingsUpdate,
   PersistedMessage,
   Session,
   SkillContent,
@@ -13,7 +18,7 @@ import type {
   SkillSummary,
 } from '../types';
 
-const BASE = 'http://127.0.0.1:8000/api';
+const BASE = import.meta.env?.VITE_API_BASE || 'http://127.0.0.1:8000/api';
 
 export class ApiError extends Error {
   readonly status: number;
@@ -80,6 +85,30 @@ async function apiRequest<T>(path: string, opts?: RequestInit): Promise<T> {
 export async function fetchSessions(): Promise<Session[]> {
   const data = await apiRequest<{ sessions: Session[] }>('/sessions');
   return data.sessions;
+}
+
+export function fetchLlmSettings(): Promise<LlmSettings> {
+  return apiRequest<LlmSettings>('/settings/llm');
+}
+
+export function saveLlmSettings(payload: LlmSettingsUpdate): Promise<LlmSettings> {
+  return apiRequest<LlmSettings>('/settings/llm', {
+    method: 'PUT',
+    body: JSON.stringify(payload),
+  });
+}
+
+export function testLlmConnection(
+  payload: LlmConnectionTestRequest,
+): Promise<LlmConnectionTestResult> {
+  return apiRequest<LlmConnectionTestResult>('/settings/llm/test', {
+    method: 'POST',
+    body: JSON.stringify(payload),
+  });
+}
+
+export function fetchLlmModels(): Promise<LlmModelsResponse> {
+  return apiRequest<LlmModelsResponse>('/settings/llm/models');
 }
 
 export async function fetchSessionMessages(chat_id: string): Promise<PersistedMessage[]> {

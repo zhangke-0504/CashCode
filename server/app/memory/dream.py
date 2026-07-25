@@ -15,11 +15,13 @@
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import Any
 
-from openai import AsyncOpenAI
-
+from ..llm.errors import is_expected_provider_failure
+from ..llm.models import LLMNotConfiguredError
+from ..llm.runtime import LLMRuntime, LLMSnapshot
 from .store import MemoryStore
 
 logger = logging.getLogger(__name__)
@@ -33,16 +35,27 @@ class SimpleDream:
     """
 
     MAX_BATCH: int = 50  # 每次最多处理的 history 条目数
+    OPERATION_TIMEOUT: float = 120.0
 
     def __init__(
         self,
-        client: AsyncOpenAI,
-        model: str,
+        runtime: LLMRuntime,
         store: MemoryStore,
+        *,
+        operation_timeout: float = OPERATION_TIMEOUT,
     ) -> None:
-        self._client = client
-        self._model = model
+        if operation_timeout <= 0:
+            raise ValueError("operation_timeout must be positive")
+        self._runtime = runtime
         self._store = store
+        self._operation_timeout = operation_timeout
+
+    @staticmethod
+    def _log_phase_failure(phase: str, exc: Exception) -> None:
+        if is_expected_provider_failure(exc):
+            logger.warning("Dream: %s provider request failed (%s)", phase, type(exc).__name__)
+        else:
+            logger.warning("Dream: %s failed", phase, exc_info=True)
 
     # ------------------------------------------------------------------
     # 数据收集
@@ -96,6 +109,7 @@ class SimpleDream:
 
     async def _phase1_analyze(
         self,
+        snapshot: LLMSnapshot,
         entries_text: str,
         current_memory: str,
     ) -> str:
@@ -113,8 +127,8 @@ class SimpleDream:
             f"## 最新对话历史\n{entries_text}\n\n"
             f"## 当前长期记忆\n{current_memory or '（尚无记忆）'}"
         )
-        response = await self._client.chat.completions.create(
-            model=self._model,
+        response = await snapshot.client.chat.completions.create(
+            model=snapshot.model,
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_content},
@@ -125,6 +139,7 @@ class SimpleDream:
 
     async def _phase2_update(
         self,
+        snapshot: LLMSnapshot,
         analysis: str,
         current_memory: str,
     ) -> str:
@@ -143,8 +158,8 @@ class SimpleDream:
             f"## 分析报告\n{analysis}\n\n"
             f"## 当前 MEMORY.md\n{current_memory or '（尚无记忆）'}"
         )
-        response = await self._client.chat.completions.create(
-            model=self._model,
+        response = await snapshot.client.chat.completions.create(
+            model=snapshot.model,
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_content},
@@ -187,33 +202,48 @@ class SimpleDream:
         entries_text = self._format_entries(batch)
         current_memory = self._store.read_memory()
 
-        # Phase 1：分析
         try:
-            analysis = await self._phase1_analyze(entries_text, current_memory)
-            logger.debug("Dream Phase 1 done (%d chars)", len(analysis))
-        except Exception:
-            logger.warning("Dream: Phase 1 failed", exc_info=True)
+            async with self._runtime.acquire_last() as snapshot:
+                try:
+                    analysis = await asyncio.wait_for(
+                        self._phase1_analyze(snapshot, entries_text, current_memory),
+                        timeout=self._operation_timeout,
+                    )
+                    logger.debug("Dream Phase 1 done (%d chars)", len(analysis))
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    self._log_phase_failure("Phase 1", exc)
+                    return False
+
+                try:
+                    new_memory = await asyncio.wait_for(
+                        self._phase2_update(snapshot, analysis, current_memory),
+                        timeout=self._operation_timeout,
+                    )
+                    logger.debug("Dream Phase 2 done (%d chars)", len(new_memory))
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    self._log_phase_failure("Phase 2", exc)
+                    return False
+
+                if new_memory.strip():
+                    self._store.write_memory(new_memory.strip())
+                    logger.info("Dream: MEMORY.md updated (%d chars)", len(new_memory))
+                else:
+                    logger.info("Dream: no memory changes (Phase 2 returned empty)")
+
+                try:
+                    self._store.set_dream_cursors(updated_cursors)
+                except Exception:
+                    logger.warning("Dream: failed to update dream cursors", exc_info=True)
+                return True
+        except LLMNotConfiguredError:
+            logger.debug("Dream: LLM is not configured, skipping")
             return False
-
-        # Phase 2：生成新 MEMORY.md
-        try:
-            new_memory = await self._phase2_update(analysis, current_memory)
-            logger.debug("Dream Phase 2 done (%d chars)", len(new_memory))
-        except Exception:
-            logger.warning("Dream: Phase 2 failed", exc_info=True)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            self._log_phase_failure("runtime acquisition", exc)
             return False
-
-        # 写入文件（空内容时跳过，避免清空已有记忆）
-        if new_memory.strip():
-            self._store.write_memory(new_memory.strip())
-            logger.info("Dream: MEMORY.md updated (%d chars)", len(new_memory))
-        else:
-            logger.info("Dream: no memory changes (Phase 2 returned empty)")
-
-        # 推进 dream cursor
-        try:
-            self._store.set_dream_cursors(updated_cursors)
-        except Exception:
-            logger.warning("Dream: failed to update dream cursors", exc_info=True)
-
-        return True

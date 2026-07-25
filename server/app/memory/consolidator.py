@@ -13,15 +13,26 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import logging
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 
-from openai import AsyncOpenAI
-
+from ..llm.errors import is_expected_provider_failure
+from ..llm.models import LLMNotConfiguredError
+from ..llm.runtime import LLMRuntime, LLMSnapshot
 from .store import MemoryStore
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True, slots=True)
+class ConsolidationPlan:
+    chat_id: str
+    to_compress: list[dict[str, Any]]
+    to_keep_count: int
+    keep_from_cursor: int | None
 
 
 class SimpleConsolidator:
@@ -29,22 +40,30 @@ class SimpleConsolidator:
 
     设计约束：
     - 不持有独立 LLM 客户端，复用 AgentLoop 的 AsyncOpenAI 实例
-    - 压缩在每轮 _turn_done 发布前执行，失败时静默跳过（不中断对话）
-    - in-place 修改 history 列表（clear + extend），AgentLoop 持有的引用感知到变化
+    - AgentLoop 在持有会话锁时捕获持久化边界，模型调用在后台执行
+    - 只有摘要持久化成功后，AgentLoop 才从存储重载内存历史
     """
 
-    CHAR_THRESHOLD: int = 500  # 触发压缩的字符数阈值, 测试用500, 默认40_000
-    KEEP_RATIO: float = 0.5        # 保留最近消息的字符比例（目标：50%）
+    CHAR_THRESHOLD: int = 40_000
+    KEEP_RATIO: float = 0.5
+    OPERATION_TIMEOUT: float = 120.0
 
     def __init__(
         self,
-        client: AsyncOpenAI,
-        model: str,
+        runtime: LLMRuntime,
         store: MemoryStore,
+        *,
+        char_threshold: int = CHAR_THRESHOLD,
+        operation_timeout: float = OPERATION_TIMEOUT,
     ) -> None:
-        self._client = client
-        self._model = model
+        if char_threshold <= 0:
+            raise ValueError("char_threshold must be positive")
+        if operation_timeout <= 0:
+            raise ValueError("operation_timeout must be positive")
+        self._runtime = runtime
         self._store = store
+        self._char_threshold = char_threshold
+        self._operation_timeout = operation_timeout
         # per-chat-id 并发锁，防止同一会话的两个并发请求同时触发压缩（参考 spore）
         self._locks: dict[str, asyncio.Lock] = {}
 
@@ -128,11 +147,13 @@ class SimpleConsolidator:
                 lines.append(f"[{ts}] {role.upper()}: {content}")
         return "\n".join(lines)
 
-    async def _summarize(self, messages: list[dict[str, Any]]) -> str:
+    async def _summarize(
+        self, snapshot: LLMSnapshot, messages: list[dict[str, Any]]
+    ) -> str:
         """非流式调用 LLM 生成对话摘要。失败时抛出异常（由 maybe_consolidate 捕获）。"""
         formatted = self._format_messages(messages)
-        response = await self._client.chat.completions.create(
-            model=self._model,
+        response = await snapshot.client.chat.completions.create(
+            model=snapshot.model,
             messages=[
                 {
                     "role": "system",
@@ -161,6 +182,8 @@ class SimpleConsolidator:
         chat_id: str,
         history: list[dict[str, Any]],
         last_consolidated: int = 0,
+        provider: str | None = None,
+        model: str | None = None,
     ) -> int:
         """检查全量上下文大小，在必要时进行累计压缩并归档摘要。
 
@@ -179,25 +202,33 @@ class SimpleConsolidator:
 
         用 per-chat-id asyncio.Lock 确保同一会话的并发调用串行执行。
         """
-        lock = self._locks.setdefault(chat_id, asyncio.Lock())
-        async with lock:
-            return await self._do_consolidate(chat_id, history, last_consolidated)
+        plan = self.prepare(chat_id, history)
+        if plan is None:
+            return last_consolidated
+        if not await self.consolidate(plan, provider=provider, model=model):
+            return last_consolidated
+        reloaded, consolidated = self._store.load_history_smart(chat_id)
+        if consolidated:
+            history.clear()
+            history.extend(reloaded)
+        return consolidated
 
-    async def _do_consolidate(
+    def prepare(
         self,
         chat_id: str,
         history: list[dict[str, Any]],
-        last_consolidated: int,
-    ) -> int:
-        # 全量估算（含摘要前缀），避免阈值盲区
+    ) -> ConsolidationPlan | None:
+        """Capture the exact prefix and cursor boundary before background work."""
+
+        snapshot = copy.deepcopy(history)
         total_chars = self._estimate_chars(history)
-        if total_chars < self.CHAR_THRESHOLD:
-            return last_consolidated
+        if total_chars < self._char_threshold:
+            return None
 
         # 边界基于完整 history（累计压缩）
-        keep_from = self._find_keep_boundary(history)
-        to_compress = history[:keep_from]   # 含旧摘要前缀
-        to_keep = history[keep_from:]
+        keep_from = self._find_keep_boundary(snapshot)
+        to_compress = snapshot[:keep_from]
+        to_keep = snapshot[keep_from:]
 
         if not to_compress:
             logger.debug(
@@ -205,7 +236,7 @@ class SimpleConsolidator:
                 "(all messages within keep boundary, keep_from=%d)",
                 chat_id, keep_from,
             )
-            return last_consolidated
+            return None
 
         # 计算 keep_from_cursor：从 history.jsonl 查询 to_keep 第一条消息的 cursor
         # 内存中的 history 消息不含 cursor 字段，需要读文件推导
@@ -215,39 +246,87 @@ class SimpleConsolidator:
             "Consolidator: starting for chat_id=%s "
             "(total_chars=%d >= threshold=%d, compress=%d msgs, keep=%d msgs, "
             "keep_from_cursor=%s)",
-            chat_id, total_chars, self.CHAR_THRESHOLD,
+            chat_id, total_chars, self._char_threshold,
             len(to_compress), len(to_keep), keep_from_cursor,
         )
 
-        # LLM 摘要（累计：to_compress 包含旧摘要前缀，让 LLM 看到完整历史）
-        try:
-            summary = await self._summarize(to_compress)
-        except Exception:
-            logger.warning(
-                "Consolidator: summarization failed for chat_id=%s, skipping",
-                chat_id, exc_info=True,
-            )
-            return last_consolidated
+        return ConsolidationPlan(
+            chat_id=chat_id,
+            to_compress=to_compress,
+            to_keep_count=len(to_keep),
+            keep_from_cursor=keep_from_cursor,
+        )
 
-        # 原子持久化：先写磁盘，成功后才替换内存历史
+    async def consolidate(
+        self,
+        plan: ConsolidationPlan,
+        *,
+        provider: str | None = None,
+        model: str | None = None,
+    ) -> bool:
+        """Generate and persist a prepared summary without mutating live history."""
+
+        lock = self._locks.setdefault(plan.chat_id, asyncio.Lock())
+        async with lock:
+            return await self._execute(plan, provider=provider, model=model)
+
+    async def _execute(
+        self,
+        plan: ConsolidationPlan,
+        *,
+        provider: str | None,
+        model: str | None,
+    ) -> bool:
+
         try:
-            self._store.append_summary(chat_id, summary, keep_from_cursor=keep_from_cursor)
+            lease = (
+                self._runtime.acquire(provider, model)
+                if provider is not None and model is not None
+                else self._runtime.acquire_last()
+            )
+            async with lease as snapshot:
+                summary = await asyncio.wait_for(
+                    self._summarize(snapshot, plan.to_compress),
+                    timeout=self._operation_timeout,
+                )
+        except LLMNotConfiguredError:
+            logger.debug("Consolidator: LLM is not configured, skipping")
+            return False
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            if is_expected_provider_failure(exc):
+                logger.warning(
+                    "Consolidator: provider request failed for chat_id=%s (%s)",
+                    plan.chat_id,
+                    type(exc).__name__,
+                )
+            else:
+                logger.warning(
+                    "Consolidator: summarization failed for chat_id=%s",
+                    plan.chat_id,
+                    exc_info=True,
+                )
+            return False
+
+        try:
+            self._store.append_summary(
+                plan.chat_id,
+                summary,
+                keep_from_cursor=plan.keep_from_cursor,
+            )
         except Exception:
             logger.warning(
                 "Consolidator: failed to persist summary for chat_id=%s, "
                 "rolling back in-memory state",
-                chat_id, exc_info=True,
+                plan.chat_id,
+                exc_info=True,
             )
-            return last_consolidated  # 不更新内存，保持一致性
-
-        # 持久化成功后才更新内存：累计模式每次只保留一条摘要前缀
-        history.clear()
-        history.append({"role": "assistant", "content": f"[历史摘要] {summary}"})
-        history.extend(to_keep)
+            return False
 
         logger.info(
-            "Consolidator: done for chat_id=%s, history now %d msgs "
-            "(1 cumulative summary + %d to_keep)",
-            chat_id, len(history), len(to_keep),
+            "Consolidator: done for chat_id=%s (keep=%d msgs)",
+            plan.chat_id,
+            plan.to_keep_count,
         )
-        return 1  # 累计模式：压缩后 last_consolidated 恒为 1
+        return True

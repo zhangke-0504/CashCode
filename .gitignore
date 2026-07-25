@@ -69,6 +69,8 @@ node_modules/
 /server/temp/
 /server/uploads/
 /server/data/
+# Explicit secret fallback in case the broader runtime-data rule is narrowed later.
+/server/data/settings/llm.json
 
 # MCP 内置目录采用白名单：只追踪配置目录和两个测试服务，用户新增目录不提交
 /mcp_servers/*

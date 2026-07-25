@@ -31,6 +31,7 @@ from app.api.sessions import router as sessions_router
 from app.api.skills import router as skills_router
 from app.api.skill_evolution import router as skill_evolution_router
 from app.api.mcp import router as mcp_router
+from app.api.llm_settings import router as llm_settings_router
 from app.bus.queue import MessageBus
 from app.agent.loop import SimpleAgentLoop
 from app.ws.channel import WebSocketChannel
@@ -39,6 +40,10 @@ from app.paths import DataPaths
 from app.skills.evolution import EvolutionService
 from app.mcp.service import MCPManagementService
 from app.mcp.store import MCPServerCatalog
+from app.llm.paths import resolve_llm_settings_path
+from app.llm.runtime import LLMRuntime
+from app.llm.service import LLMSettingsService
+from app.llm.store import LLMSettingsStore
 
 
 # ---------------------------------------------------------------------------
@@ -50,6 +55,16 @@ ws_channel: WebSocketChannel | None = None
 agent_task: asyncio.Task | None = None
 ws_task: asyncio.Task | None = None
 dream_task: asyncio.Task | None = None
+
+
+def _allowed_frontend_origins() -> set[str]:
+    raw = os.environ.get("CASHCODE_ALLOWED_ORIGINS", "")
+    if raw.strip():
+        return {value.strip().rstrip("/") for value in raw.split(",") if value.strip()}
+    return {"http://127.0.0.1:5173", "http://localhost:5173"}
+
+
+ALLOWED_FRONTEND_ORIGINS = _allowed_frontend_origins()
 
 
 async def _dream_loop(dream: SimpleDream) -> None:
@@ -80,6 +95,15 @@ async def lifespan(app: FastAPI):
     paths = DataPaths.from_environment()
     paths.ensure()
     app.state.data_paths = paths
+    llm_runtime = LLMRuntime()
+    llm_settings_service = LLMSettingsService(
+        LLMSettingsStore(resolve_llm_settings_path()),
+        llm_runtime,
+        allowed_origins=ALLOWED_FRONTEND_ORIGINS,
+    )
+    await llm_settings_service.initialize()
+    app.state.llm_runtime = llm_runtime
+    app.state.llm_settings_service = llm_settings_service
     # 合并只读内置目录与用户目录；启动阶段只加载配置，不主动建立 MCP 连接。
     project_root = Path(__file__).resolve().parent.parent
     mcp_catalog = MCPServerCatalog(
@@ -87,7 +111,7 @@ async def lifespan(app: FastAPI):
         paths.mcp_servers,
     )
     bus = MessageBus()
-    agent = SimpleAgentLoop(bus, data_paths=paths)
+    agent = SimpleAgentLoop(bus, data_paths=paths, llm_runtime=llm_runtime)
     agent.load_mcp_configs(mcp_catalog.runtime_configs(project_root))
     # API 通过应用状态访问同一个 Agent，保证目录变更与实时工具状态一致。
     app.state.agent = agent
@@ -97,8 +121,7 @@ async def lifespan(app: FastAPI):
     app.state.skill_catalog = agent.skill_catalog
     app.state.skill_store = agent.skill_store
     evolution = EvolutionService(
-        agent._client,
-        agent._model,
+        llm_runtime,
         agent.skill_catalog,
         agent.skill_store,
         paths.skill_evolution,
@@ -106,8 +129,7 @@ async def lifespan(app: FastAPI):
     app.state.skill_evolution = evolution
     agent.set_skill_evolution(evolution)
     ws_channel = WebSocketChannel(bus, host=ws_host, port=ws_port)
-    # Dream 复用 Agent 的模型客户端、模型名称和存储实例，无需额外初始化。
-    dream = SimpleDream(agent._client, agent._model, agent._store)
+    dream = SimpleDream(llm_runtime, agent._store)
 
     agent_task = asyncio.create_task(agent.run())
     ws_task = asyncio.create_task(ws_channel.start())
@@ -131,6 +153,7 @@ async def lifespan(app: FastAPI):
                     await task
                 except asyncio.CancelledError:
                     pass
+        await llm_runtime.close()
         logger.info("Shutdown complete")
 
 
@@ -141,7 +164,7 @@ app = FastAPI(title="CashCode API", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=sorted(ALLOWED_FRONTEND_ORIGINS),
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -153,6 +176,7 @@ app.include_router(sessions_router, prefix="/api")
 app.include_router(skills_router, prefix="/api")
 app.include_router(skill_evolution_router, prefix="/api")
 app.include_router(mcp_router, prefix="/api")
+app.include_router(llm_settings_router, prefix="/api")
 
 
 if __name__ == "__main__":

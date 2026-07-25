@@ -17,6 +17,7 @@ import {
 } from '../src/lib/selections.ts';
 
 const emptyDraft = () => ({ skills: [], mcps: [] });
+const llm = { provider: 'ollama' as const, model: 'qwen3' };
 
 test('deduplicates canonical selections and preserves typed identities', () => {
   const draft = addSkillSelection(emptyDraft(), { name: 'code-review', label: '代码审查' });
@@ -56,22 +57,24 @@ test('parses only boundary triggers and removes the active query', () => {
 });
 
 test('builds plain content with canonical metadata and omits empty metadata', () => {
-  assert.deepEqual(buildMessageFrame('chat-1', '  执行任务  ', emptyDraft()), {
+  assert.deepEqual(buildMessageFrame('chat-1', '  执行任务  ', emptyDraft(), llm), {
     type: 'message',
     chat_id: 'chat-1',
     content: '执行任务',
+    metadata: { llm },
   });
 
   assert.deepEqual(
     buildMessageFrame('chat-1', '执行任务', {
       skills: [{ name: 'review', label: '审查' }],
       mcps: [{ server: 'github', label: 'GitHub' }],
-    }),
+    }, llm),
     {
       type: 'message',
       chat_id: 'chat-1',
       content: '执行任务',
       metadata: {
+        llm,
         mentioned_skills: [{ name: 'review', label: '审查' }],
         selected_mcp_connectors: [{ server: 'github', label: 'GitHub' }],
       },
@@ -104,7 +107,7 @@ test('creates optimistic messages with the same receipts as the outbound frame',
   const frame = buildMessageFrame('chat-2', '检查状态', {
     skills: [{ name: 'review', label: '代码审查' }],
     mcps: [{ server: 'github', label: 'GitHub' }],
-  });
+  }, llm);
 
   assert.deepEqual(optimisticMessageFromFrame(frame, 'message-1'), {
     id: 'message-1',

@@ -1,6 +1,7 @@
 // Sidebar: primary navigation and collapsible session history
 import { useCallback, useEffect, useRef, useState } from 'react';
 import {
+  BrainCircuit,
   ChevronDown,
   History,
   MessageSquare,
@@ -8,6 +9,7 @@ import {
   Network,
   Pencil,
   Plus,
+  Settings,
   Trash2,
   Zap,
 } from 'lucide-react';
@@ -42,13 +44,30 @@ export function Sidebar({ activeView, mobileOpen, onCloseMobile, onViewChange }:
   const [renamingId, setRenamingId] = useState<string | null>(null);
   const [renameValue, setRenameValue] = useState('');
   const [historyExpanded, setHistoryExpanded] = useState(true);
+  const [settingsMenuOpen, setSettingsMenuOpen] = useState(false);
   const renameInputRef = useRef<HTMLInputElement>(null);
+  const settingsMenuRef = useRef<HTMLDivElement>(null);
 
   // Close menu when clicking outside
   useEffect(() => {
     const handler = () => setMenuOpenFor(null);
     document.addEventListener('click', handler);
     return () => document.removeEventListener('click', handler);
+  }, []);
+
+  useEffect(() => {
+    const closeOnOutside = (event: MouseEvent) => {
+      if (!settingsMenuRef.current?.contains(event.target as Node)) setSettingsMenuOpen(false);
+    };
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') setSettingsMenuOpen(false);
+    };
+    document.addEventListener('mousedown', closeOnOutside);
+    document.addEventListener('keydown', closeOnEscape);
+    return () => {
+      document.removeEventListener('mousedown', closeOnOutside);
+      document.removeEventListener('keydown', closeOnEscape);
+    };
   }, []);
 
   // Focus rename input when it appears
@@ -149,6 +168,7 @@ export function Sidebar({ activeView, mobileOpen, onCloseMobile, onViewChange }:
       </div>
 
       <div className="mx-3 border-t border-zinc-800" />
+      <div className="flex min-h-0 flex-1 flex-col">
       <button
         type="button"
         className="mx-2 mt-2 flex items-center gap-2 px-3 py-2 rounded-md text-xs font-medium text-zinc-500 hover:bg-zinc-800/70 hover:text-zinc-300 transition-colors"
@@ -167,7 +187,7 @@ export function Sidebar({ activeView, mobileOpen, onCloseMobile, onViewChange }:
         id="sidebar-history"
         aria-label="历史记录"
         hidden={!historyExpanded}
-        className="flex-1 min-h-0 overflow-y-auto px-2 pb-2"
+        className="min-h-0 flex-1 overflow-y-auto px-2 pb-2"
       >
         {sessions.length === 0 ? (
           <p className="text-xs text-zinc-600 px-2 py-4 text-center">暂无会话</p>
@@ -241,6 +261,40 @@ export function Sidebar({ activeView, mobileOpen, onCloseMobile, onViewChange }:
           </div>
         ))}
       </nav>
+      </div>
+      <div ref={settingsMenuRef} className="relative border-t border-zinc-800 p-2">
+        {settingsMenuOpen && (
+          <div id="sidebar-settings-menu" role="menu" className="absolute bottom-full left-2 right-2 z-50 mb-1 rounded-md border border-zinc-700 bg-zinc-900 py-1 shadow-xl">
+            <button
+              type="button"
+              role="menuitem"
+              onClick={() => {
+                setSettingsMenuOpen(false);
+                onViewChange('llm-settings');
+              }}
+              className={`flex w-full items-center gap-2 px-3 py-2 text-left text-sm transition-colors ${activeView === 'llm-settings' ? 'bg-zinc-800 text-zinc-100' : 'text-zinc-300 hover:bg-zinc-800'}`}
+            >
+              <BrainCircuit className="h-4 w-4" />
+              LLM 设置
+            </button>
+          </div>
+        )}
+        <button
+          type="button"
+          aria-haspopup="menu"
+          aria-expanded={settingsMenuOpen}
+          aria-controls="sidebar-settings-menu"
+          onClick={(event) => {
+            event.stopPropagation();
+            setSettingsMenuOpen((open) => !open);
+          }}
+          className={`flex w-full items-center gap-2 rounded-md px-3 py-2 text-sm transition-colors ${activeView === 'llm-settings' ? 'bg-zinc-800 text-zinc-100' : 'text-zinc-400 hover:bg-zinc-800 hover:text-zinc-200'}`}
+        >
+          <Settings className="h-4 w-4" />
+          设置
+          <ChevronDown className={`ml-auto h-3.5 w-3.5 transition-transform ${settingsMenuOpen ? 'rotate-180' : ''}`} />
+        </button>
+      </div>
       </aside>
     </>
   );

@@ -6,8 +6,75 @@ export interface Session {
   updated_at: string;
 }
 
-export const APP_VIEWS = ['chat', 'mcp-market', 'skill-market'] as const;
+export const APP_VIEWS = ['chat', 'mcp-market', 'skill-market', 'llm-settings'] as const;
 export type AppView = (typeof APP_VIEWS)[number];
+
+export type LlmProvider = 'openai_compatible' | 'ollama';
+
+export interface LlmSelection {
+  provider: LlmProvider;
+  model: string;
+}
+
+export interface OpenAICompatibleSettings {
+  base_url: string;
+  ready: boolean;
+  api_key_configured: boolean;
+}
+
+export interface OllamaSettings {
+  base_url: string;
+  ready: boolean;
+}
+
+export interface LlmSettings {
+  configured: boolean;
+  openai_compatible: OpenAICompatibleSettings;
+  ollama: OllamaSettings;
+}
+
+export interface OpenAICompatibleSettingsInput {
+  base_url: string;
+  api_key?: string;
+  clear_api_key: boolean;
+}
+
+export interface OllamaSettingsInput {
+  base_url: string;
+}
+
+export interface LlmSettingsUpdate {
+  openai_compatible: OpenAICompatibleSettingsInput;
+  ollama: OllamaSettingsInput;
+}
+
+export interface LlmConnectionTestRequest {
+  provider: LlmProvider;
+  openai_compatible: OpenAICompatibleSettingsInput;
+  ollama: OllamaSettingsInput;
+}
+
+export interface LlmConnectionTestResult {
+  success: boolean;
+  provider: LlmProvider;
+  model_count: number;
+  message: string;
+}
+
+export interface LlmModelRecord {
+  provider: LlmProvider;
+  id: string;
+}
+
+export interface LlmModelProviderState {
+  ready: boolean;
+  error: string | null;
+}
+
+export interface LlmModelsResponse {
+  models: Array<{ provider: LlmProvider; id: string }>;
+  providers: Record<LlmProvider, LlmModelProviderState>;
+}
 
 export type McpLifecycleStatus = 'disconnected' | 'connecting' | 'connected' | 'error';
 export type McpTransport = 'sse' | 'stdio';
@@ -138,6 +205,7 @@ export interface McpSelectionReceipt {
 export interface CapabilitySelections {
   mentioned_skills?: SkillSelectionReceipt[];
   selected_mcp_connectors?: McpSelectionReceipt[];
+  llm?: LlmSelection;
 }
 
 export interface ToolCallBlock {
@@ -168,7 +236,7 @@ export type OutboundWsFrame =
   | { type: 'new_chat' }
   | { type: 'attach'; chat_id: string }
   | { type: 'cancel'; chat_id: string }
-  | { type: 'message'; chat_id: string; content: string; metadata?: CapabilitySelections };
+  | { type: 'message'; chat_id: string; content: string; metadata: CapabilitySelections & { llm: LlmSelection } };
 
 export type WsConnectionState = 'connecting' | 'connected' | 'disconnected' | 'error';
 

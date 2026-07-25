@@ -12,8 +12,8 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
-from openai import AsyncOpenAI
-
+from ..llm.models import LLMNotConfiguredError
+from ..llm.runtime import LLMRuntime
 from .catalog import SkillCatalog
 from .loader import parse_skill_text
 from .models import SkillConflictError, SkillError, SkillSource
@@ -67,15 +67,13 @@ class EvolutionService:
 
     def __init__(
         self,
-        client: AsyncOpenAI,
-        model: str,
+        runtime: LLMRuntime,
         catalog: SkillCatalog,
         skill_store: SkillStore,
         root: Path,
         config: EvolutionConfig | None = None,
     ) -> None:
-        self.client = client
-        self.model = model
+        self.runtime = runtime
         self.catalog = catalog
         self.skill_store = skill_store
         self.root = root.resolve()
@@ -96,6 +94,8 @@ class EvolutionService:
         tools_used: list[str],
         durable_messages: list[dict[str, Any]],
         persisted: bool,
+        provider: str | None = None,
+        model: str | None = None,
     ) -> None:
         if not self.config.enabled or not persisted or len(tools_used) < self.config.min_tool_calls:
             return
@@ -105,6 +105,8 @@ class EvolutionService:
             final_content=final_content,
             tools_used=tools_used,
             durable_messages=durable_messages,
+            provider=provider,
+            model=model,
         ))
         self._tasks.add(task)
         task.add_done_callback(self._tasks.discard)
@@ -140,6 +142,8 @@ class EvolutionService:
         final_content: str,
         tools_used: list[str],
         durable_messages: list[dict[str, Any]],
+        provider: str | None,
+        model: str | None,
     ) -> None:
         async with self._gate:
             fingerprint = self._fingerprint(user_content, tools_used)
@@ -170,7 +174,9 @@ class EvolutionService:
                     matches.append(row)
             if len(matches) < self.config.recurrence or self._has_open_fingerprint(fingerprint):
                 return
-            await self._generate_proposal(matches[-self.config.recurrence:], fingerprint)
+            await self._generate_proposal(
+                matches[-self.config.recurrence:], fingerprint, provider, model
+            )
 
     def _prune_evidence(self) -> None:
         paths = sorted(
@@ -191,7 +197,13 @@ class EvolutionService:
                 return True
         return False
 
-    async def _generate_proposal(self, evidence: list[dict[str, Any]], fingerprint: str) -> None:
+    async def _generate_proposal(
+        self,
+        evidence: list[dict[str, Any]],
+        fingerprint: str,
+        provider: str | None,
+        model: str | None,
+    ) -> None:
         summaries = [record.to_dict() for record in self.catalog.list()[:80]]
         creator = self.catalog.get("skill-creator")
         contract = ""
@@ -209,14 +221,24 @@ class EvolutionService:
                 "At most one conceptual Skill proposal.",
             ],
         }
-        response = await self.client.chat.completions.create(
-            model=self.model,
-            messages=[
-                {"role": "system", "content": "You are a restricted Skill proposal generator. You cannot modify files or call tools."},
-                {"role": "user", "content": json.dumps(prompt, ensure_ascii=False)[:self.config.max_context_chars]},
-            ],
-            stream=False,
-        )
+        try:
+            lease = (
+                self.runtime.acquire(provider, model)
+                if provider is not None and model is not None
+                else self.runtime.acquire_last()
+            )
+            async with lease as snapshot:
+                response = await snapshot.client.chat.completions.create(
+                    model=snapshot.model,
+                    messages=[
+                        {"role": "system", "content": "You are a restricted Skill proposal generator. You cannot modify files or call tools."},
+                        {"role": "user", "content": json.dumps(prompt, ensure_ascii=False)[:self.config.max_context_chars]},
+                    ],
+                    stream=False,
+                )
+        except LLMNotConfiguredError:
+            logger.debug("Evolution: LLM is not configured, skipping proposal")
+            return
         raw = response.choices[0].message.content or ""
         try:
             data = json.loads(raw)

@@ -44,7 +44,7 @@ function skill(overrides: Partial<SkillSummary> = {}): SkillSummary {
 }
 
 test('includes the Skill market in application views', () => {
-  assert.deepEqual(APP_VIEWS, ['chat', 'mcp-market', 'skill-market']);
+  assert.deepEqual(APP_VIEWS, ['chat', 'mcp-market', 'skill-market', 'llm-settings']);
 });
 
 test('builds encoded paginated Skill queries', () => {

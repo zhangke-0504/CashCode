@@ -211,13 +211,23 @@ class WebSocketChannel:
                 await self._send(conn, {"event": "error", "detail": "invalid chat_id"})
                 return
             if not isinstance(content, str) or not content.strip():
-                await self._send(conn, {"event": "error", "detail": "missing content"})
+                await self._send(conn, {
+                    "event": "error",
+                    "detail": "missing content",
+                    "chat_id": cid,
+                })
                 return
             # 选择元数据来自客户端，必须在进入消息总线前完成结构和数量校验。
             try:
-                metadata = sanitize_selection_metadata(envelope.get("metadata"))
+                metadata = sanitize_selection_metadata(
+                    envelope.get("metadata"), require_llm=True
+                )
             except SelectionValidationError as exc:
-                await self._send(conn, {"event": "error", "detail": str(exc)})
+                await self._send(conn, {
+                    "event": "error",
+                    "detail": str(exc),
+                    "chat_id": cid,
+                })
                 return
             # 自动订阅，使客户端可以省略单独的附加会话帧。
             self._attach(conn, cid)
