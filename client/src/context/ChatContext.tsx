@@ -6,9 +6,17 @@ import React, {
   useRef,
 } from 'react';
 import { v4 as uuid } from 'uuid';
-import type { Message, Session, ToolCallBlock, WsConnectionState, WsFrame } from '../types';
+import type {
+  Message,
+  OutboundWsFrame,
+  Session,
+  ToolCallBlock,
+  WsConnectionState,
+  WsFrame,
+} from '../types';
 import { useWebSocket } from '../hooks/useWebSocket';
 import { fetchSessionMessages, fetchSessions } from '../lib/api';
+import { normalizePersistedMessage, optimisticMessageFromFrame } from '../lib/selections';
 
 // ---------------------------------------------------------------------------
 // State shape
@@ -54,7 +62,7 @@ type Action =
   | { type: 'WS_TOOL_CALL'; chat_id: string; tool_name: string; stream_id: number }
   | { type: 'WS_TOOL_RESULT'; chat_id: string; tool_name: string; result: string; stream_id: number }
   | { type: 'WS_ERROR'; detail: string }
-  | { type: 'USER_MESSAGE_SENT'; chat_id: string; content: string };
+  | { type: 'USER_MESSAGE_SENT'; frame: Extract<OutboundWsFrame, { type: 'message' }> };
 
 function ensureSession(messages: Record<string, Message[]>, id: string) {
   return messages[id] ?? [];
@@ -145,16 +153,13 @@ function reducer(state: ChatState, action: Action): ChatState {
     }
 
     case 'USER_MESSAGE_SENT': {
-      const msg: Message = {
-        id: uuid(),
-        role: 'user',
-        content: action.content,
-      };
-      const prev = ensureSession(state.messages, action.chat_id);
+      const msg = optimisticMessageFromFrame(action.frame, uuid());
+      const prev = ensureSession(state.messages, action.frame.chat_id);
       return {
         ...state,
         streaming: true,
-        messages: { ...state.messages, [action.chat_id]: [...prev, msg] },
+        error: null,
+        messages: { ...state.messages, [action.frame.chat_id]: [...prev, msg] },
       };
     }
 
@@ -258,7 +263,7 @@ function reducer(state: ChatState, action: Action): ChatState {
 // ---------------------------------------------------------------------------
 interface ChatContextValue {
   state: ChatState;
-  send: (frame: object) => void;
+  send: (frame: OutboundWsFrame) => boolean;
   dispatch: React.Dispatch<Action>;
   reloadSessions: () => Promise<void>;
 }
@@ -334,7 +339,7 @@ export function ChatProvider({ children }: { children: React.ReactNode }) {
         dispatch({
           type: 'MESSAGES_LOADED',
           chat_id: chatId,
-          messages: messages.map((message) => ({ ...message, id: uuid() })),
+          messages: messages.map((message) => ({ ...normalizePersistedMessage(message), id: uuid() })),
         });
       })
       .catch((e) => {
@@ -353,6 +358,7 @@ export function ChatProvider({ children }: { children: React.ReactNode }) {
   );
 }
 
+// oxlint-disable-next-line react/only-export-components
 export function useChatContext() {
   const ctx = useContext(ChatContext);
   if (!ctx) throw new Error('useChatContext must be used within ChatProvider');

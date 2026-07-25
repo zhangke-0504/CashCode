@@ -7,10 +7,10 @@
   core.agent.mcp_skill_activation_ctx — FullRegistry ContextVar
 
 暴露的公共接口：
-  ActivatedToolSet         LRU 激活集，持久化到 session metadata
+  ActivatedToolSet         LRU 激活集，持久化到会话元数据
   use_activated_set(set)   ContextVar 上下文管理器
   get_activated_set()      读取当前绑定
-  DeferredAwareRegistry    包装 ToolRegistry，MCP 工具默认 deferred
+  DeferredAwareRegistry    包装 ToolRegistry，MCP 工具默认延迟公开
   ToolSearchTool           内置工具：BM25 搜索 + 激活
   MCPPrepareTool           内置工具：按需连接 + 激活
 """
@@ -35,7 +35,7 @@ import logging
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# ActivatedToolSet
+# ActivatedToolSet：会话工具激活集
 # ---------------------------------------------------------------------------
 
 _METADATA_KEY = "activated_tools"
@@ -43,10 +43,10 @@ _DEFAULT_MAX_SIZE = 50
 
 
 class ActivatedToolSet:
-    """Session 级 LRU 激活集：{tool_name: last_touched_ts}。
+    """会话级 LRU 激活集：``{工具名: 最后使用时间}``。
 
-    直接持有 session.metadata["activated_tools"] dict 的引用，
-    写入即反映到 metadata，无需额外同步。
+    直接持有会话 metadata 中 ``activated_tools`` 字典的引用，
+    写入会立即反映到 metadata，无需额外同步。
     """
 
     def __init__(self, data: dict[str, Any], max_size: int = _DEFAULT_MAX_SIZE) -> None:
@@ -55,7 +55,7 @@ class ActivatedToolSet:
         pairs.sort(key=lambda kv: kv[1] if isinstance(kv[1], (int, float)) else 0)
         self._data: OrderedDict[str, float] = OrderedDict(pairs)
         self._visibility_revision = 0
-        self._raw: dict[str, Any] = data  # metadata 子dict 的引用，写入即持久化
+        self._raw: dict[str, Any] = data  # metadata 子字典的引用，写入即持久化。
 
     @classmethod
     def from_session(cls, metadata: dict[str, Any], max_size: int = _DEFAULT_MAX_SIZE) -> "ActivatedToolSet":
@@ -114,11 +114,14 @@ class ActivatedToolSet:
 _current_activated_set: ContextVar["ActivatedToolSet | None"] = ContextVar(
     "mcp_current_activated_set", default=None
 )
+_current_temporary_tools: ContextVar[frozenset[str]] = ContextVar(
+    "mcp_current_temporary_tools", default=frozenset()
+)
 
 
 @contextmanager
 def use_activated_set(activated_set: "ActivatedToolSet") -> Iterator[None]:
-    """将 activated_set 绑定到当前 async task（含子 task）。"""
+    """将激活集绑定到当前异步任务及其子任务。"""
     token = _current_activated_set.set(activated_set)
     try:
         yield
@@ -130,15 +133,32 @@ def get_activated_set() -> "ActivatedToolSet | None":
     return _current_activated_set.get()
 
 
+@contextmanager
+def use_temporary_tools(names: set[str] | frozenset[str]) -> Iterator[None]:
+    """在当前异步上下文中临时公开指定工具，并在退出时恢复原状态。"""
+
+    token = _current_temporary_tools.set(frozenset(names))
+    try:
+        yield
+    finally:
+        _current_temporary_tools.reset(token)
+
+
+def get_temporary_tools() -> frozenset[str]:
+    """返回当前对话轮次临时可见的工具名称集合。"""
+
+    return _current_temporary_tools.get()
+
+
 # ---------------------------------------------------------------------------
-# DeferredAwareRegistry
+# DeferredAwareRegistry：延迟工具可见性注册表
 # ---------------------------------------------------------------------------
 
 class DeferredAwareRegistry(ToolRegistry):
-    """包装 FullRegistry，MCP 工具默认 deferred（对 LLM 不可见）。
+    """包装完整注册表，MCP 工具默认延迟公开，对模型不可见。
 
     get_definitions() 每次调用都从 ActivatedToolSet 动态计算可见工具列表，
-    缓存 key 包含 activation_revision，激活后立即生效。
+    缓存键包含激活版本号，激活后立即生效。
     """
 
     def __init__(self, full_registry: ToolRegistry) -> None:
@@ -152,25 +172,32 @@ class DeferredAwareRegistry(ToolRegistry):
     def get_definitions(self) -> list[dict[str, Any]]:
         activated_set = get_activated_set()
         activated_names = activated_set.activated_names() if activated_set else frozenset()
+        temporary_names = get_temporary_tools()
+        visible_names = activated_names | temporary_names
         activation_rev = activated_set.visibility_revision if activated_set else -1
-        cache_key = (self._full.membership_revision, activation_rev, self._membership_revision)
+        cache_key = (
+            self._full.membership_revision,
+            activation_rev,
+            tuple(sorted(temporary_names)),
+            self._membership_revision,
+        )
         if self._projection_cache_key == cache_key and self._cached_definitions is not None:
             return self._cached_definitions
 
         definitions: list[dict] = []
         seen: set[str] = set()
-        # Pass 1: 本 registry 的工具（tool_search、mcp_prepare 等 builtin）
+        # 第一阶段：加入本注册表中的 tool_search、mcp_prepare 等内置工具。
         for name, tool in self._tools.items():
             definitions.append(tool.to_schema())
             seen.add(name)
-        # Pass 2: FullRegistry 的工具，deferred 工具只在激活集中才可见
+        # 第二阶段：加入完整注册表工具，延迟工具仅在获得激活权限时可见。
         for name in self._full.tool_names:
             if name in seen:
                 continue
             tool = self._full.get(name)
             if tool is None:
                 continue
-            if not self._is_deferred(name) or name in activated_names:
+            if not self._is_deferred(name) or name in visible_names:
                 definitions.append(tool.to_schema())
 
         builtins = [s for s in definitions if not self._schema_name(s).startswith("mcp_")]
@@ -186,7 +213,7 @@ class DeferredAwareRegistry(ToolRegistry):
             return super().prepare_call(name, params)
         if self._is_deferred(name):
             activated_set = get_activated_set()
-            if activated_set is not None and name in activated_set:
+            if (activated_set is not None and name in activated_set) or name in get_temporary_tools():
                 return self._full.prepare_call(name, params)
             msg = (
                 f"工具 '{name}' 已注册但尚未激活。请先调用 tool_search 搜索相关工具，"
@@ -201,9 +228,10 @@ class DeferredAwareRegistry(ToolRegistry):
             return await super().execute(name, params)
         if self._is_deferred(name):
             activated_set = get_activated_set()
-            if activated_set is not None and name in activated_set:
+            if (activated_set is not None and name in activated_set) or name in get_temporary_tools():
                 result = await self._full.execute(name, params)
-                activated_set.touch(name)
+                if activated_set is not None and name in activated_set:
+                    activated_set.touch(name)
                 return result
             return (
                 f"工具 '{name}' 尚未激活，无法执行。"
@@ -248,7 +276,7 @@ class ServiceMeta:
 
 @dataclass
 class ToolMeta:
-    name: str              # wrapped name: mcp_server_tool
+    name: str              # 包装后的名称，例如 mcp_server_tool。
     original_name: str = ""
     description: str = ""
     input_schema: dict[str, Any] = field(default_factory=dict)
@@ -260,8 +288,8 @@ class IndexDocument:
     service_meta: ServiceMeta
     tool_meta: "ToolMeta | None"
     search_text: str
-    source: str = "cache"        # "live" | "cache"
-    callable: bool = True        # False = cache-only, needs mcp_prepare
+    source: str = "cache"        # 数据来源为实时连接或磁盘缓存。
+    callable: bool = True        # False 表示仅有缓存，需先调用 mcp_prepare。
     requires_preparation: bool = False
 
 
@@ -319,7 +347,7 @@ def tokenize(text: str) -> list[str]:
 
 
 # ---------------------------------------------------------------------------
-# ToolSearchIndex — BM25（k1=1.5, b=0.75）
+# ToolSearchIndex：BM25 工具搜索索引（k1=1.5, b=0.75）
 # ---------------------------------------------------------------------------
 
 _BM25_K1 = 1.5
@@ -393,11 +421,11 @@ class ToolSearchIndex:
 
 
 # ---------------------------------------------------------------------------
-# CacheFeeder — 合并 disk cache + live ToolRegistry
+# CacheFeeder：合并磁盘缓存与实时 ToolRegistry
 # ---------------------------------------------------------------------------
 
 class CacheFeeder:
-    """从 disk cache + live ToolRegistry 构建 IndexDocument 列表。"""
+    """从磁盘缓存和实时 ToolRegistry 构建索引文档列表。"""
 
     def __init__(self, mcp_servers: dict, registry: ToolRegistry) -> None:
         self._servers = mcp_servers
@@ -413,7 +441,7 @@ class CacheFeeder:
             display_name = cfg.get("display_name") or server_name
             description  = cfg.get("description") or ""
 
-            # 读 live registry（已连接 server 的 wrapper）
+            # 读取实时注册表中已连接服务的工具包装器。
             live_tools: dict[str, dict] = {}
             prefix = f"mcp_{server_name}_"
             for tool_name in self._registry.tool_names:
@@ -430,11 +458,11 @@ class CacheFeeder:
                     "wrapped_name": tool_name,
                 }
 
-            # 读 disk cache
+            # 读取磁盘工具缓存。
             cached = read_cache(server_name, cfg)
             cached_tools = {t["name"]: t for t in (cached or [])}
 
-            # 合并：live 优先
+            # 合并同名工具时优先采用实时数据。
             all_tools: dict[str, tuple[dict, str, bool]] = {}
             for raw_name, t in cached_tools.items():
                 all_tools[raw_name] = (t, "cache", False)
@@ -460,8 +488,8 @@ class CacheFeeder:
                     requires_preparation=not is_callable,
                 ))
 
-            # 若该 server 没有任何工具（无 cache 也无 live 连接），
-            # 仍生成一个服务级存根，使 tool_search 能找到它并引导 mcp_prepare
+            # 若该服务既无缓存工具也无实时连接，仍生成服务级存根，
+            # 使 tool_search 能找到它并引导 mcp_prepare。
             if not all_tools:
                 search_text = " ".join(filter(None, [
                     server_name, display_name, description,
@@ -479,11 +507,11 @@ class CacheFeeder:
 
 
 # ---------------------------------------------------------------------------
-# ToolSearchTool
+# ToolSearchTool：模型可调用的工具搜索入口
 # ---------------------------------------------------------------------------
 
 class ToolSearchTool(Tool):
-    """内置工具：BM25 搜索 MCP 工具并激活命中结果。永远对 LLM 可见（非 deferred）。"""
+    """内置工具：用 BM25 搜索并激活 MCP 工具，始终对模型可见。"""
 
     def __init__(self, full_registry: ToolRegistry, mcp_servers: dict) -> None:
         self._registry = full_registry
@@ -526,7 +554,7 @@ class ToolSearchTool(Tool):
         newly_activated: list[str] = []
         for score, doc in hits:
             if doc.tool_meta is None:
-                # 服务级存根：server 已配置但未连接，引导 mcp_prepare
+                # 服务级存根：服务已配置但未连接，用于引导 mcp_prepare。
                 svc = doc.service_meta
                 header = svc.display_name or doc.server_name
                 desc = f"：{svc.description}" if svc.description else ""
@@ -557,11 +585,11 @@ class ToolSearchTool(Tool):
 
 
 # ---------------------------------------------------------------------------
-# MCPPrepareTool
+# MCPPrepareTool：模型可调用的 MCP 连接入口
 # ---------------------------------------------------------------------------
 
 class MCPPrepareTool(Tool):
-    """内置工具：按需建立 MCP server 连接并激活其工具。永远对 LLM 可见（非 deferred）。
+    """内置工具：按需连接 MCP 服务并激活其工具，始终对模型可见。
 
     prepare_callback: async (server_name) -> bool
         由 loop.py 注入，负责调用 lazy_connect + list_tools + write_cache + register wrappers。

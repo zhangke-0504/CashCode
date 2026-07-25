@@ -1,4 +1,9 @@
-## ADDED Requirements
+# Chat View Specification
+
+## Purpose
+Define conversation rendering, streaming presentation, scrolling behavior, tool progress, and selected capability references in the chat view.
+
+## Requirements
 
 ### Requirement: Display conversation messages
 The system SHALL render all messages in the active session as a scrollable conversation list.
@@ -47,3 +52,22 @@ The system SHALL render tool calls as collapsible blocks above the assistant rep
 #### Scenario: Tool call completed
 - **WHEN** the corresponding `tool_result` event arrives
 - **THEN** the row updates to show a checkmark and a preview of the result (truncated at 200 chars)
+
+### Requirement: Render selected capability references on user messages
+The chat view SHALL render Skill and MCP selection receipts as compact typed references associated with the user message, using the display label with canonical identity as fallback.
+
+#### Scenario: Optimistic selected message is rendered
+- **WHEN** the user sends a message with Skill or MCP chips
+- **THEN** the optimistic user bubble immediately shows matching Skill/MCP references and plain task content
+
+#### Scenario: Persisted selected message is loaded
+- **WHEN** session history returns selection receipts
+- **THEN** the restored user bubble shows the same reference types and labels as the sent message
+
+#### Scenario: Display label is absent
+- **WHEN** a persisted reference has a canonical identity but no usable label
+- **THEN** the chat view displays the canonical Skill name or MCP server name without breaking layout
+
+#### Scenario: Message has no references
+- **WHEN** a user message contains no selection metadata
+- **THEN** the bubble retains the existing plain-content rendering with no empty reference container

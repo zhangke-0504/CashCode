@@ -5,3 +5,4 @@ from .health import health
 from .sessions import router as sessions_router
 from .skills import router as skills_router
 from .skill_evolution import router as skill_evolution_router
+from .mcp import router as mcp_router

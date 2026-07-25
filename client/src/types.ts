@@ -6,6 +6,86 @@ export interface Session {
   updated_at: string;
 }
 
+export type AppView = 'chat' | 'mcp-market';
+
+export type McpLifecycleStatus = 'disconnected' | 'connecting' | 'connected' | 'error';
+export type McpTransport = 'sse' | 'stdio';
+
+export interface McpServer {
+  name: string;
+  display_name: string;
+  description: string;
+  type: McpTransport;
+  url: string;
+  headers: Record<string, string>;
+  builtin: boolean;
+  mutable: boolean;
+  status: McpLifecycleStatus;
+  connected: boolean;
+  status_error: string | null;
+  tool_count: number;
+}
+
+export interface McpServerCreate {
+  name: string;
+  type: 'sse';
+  display_name: string;
+  description: string;
+  url: string;
+  headers: Record<string, string>;
+}
+
+export type McpServerUpdate = Omit<McpServerCreate, 'name'>;
+
+export interface McpTool {
+  name: string;
+  original_name: string;
+  description: string;
+  input_schema: Record<string, unknown>;
+  source: 'live' | 'cache';
+  callable: boolean;
+}
+
+export interface McpToolsResponse {
+  server: string;
+  display_name: string;
+  tools: McpTool[];
+  source: 'live' | 'cache' | 'none';
+  status: McpLifecycleStatus;
+  connected: boolean;
+  status_error: string | null;
+  tool_count: number;
+}
+
+export interface SkillSummary {
+  name: string;
+  description: string;
+  version: number;
+  tags: string[];
+  triggers: string[];
+  always: boolean;
+  source: 'builtin' | 'user' | 'agent';
+  enabled: boolean;
+  availability: 'available' | 'missing_dependency' | 'disabled' | 'invalid';
+  missing: string[];
+  mutable: boolean;
+}
+
+export interface SkillSelectionReceipt {
+  name: string;
+  label?: string;
+}
+
+export interface McpSelectionReceipt {
+  server: string;
+  label?: string;
+}
+
+export interface CapabilitySelections {
+  mentioned_skills?: SkillSelectionReceipt[];
+  selected_mcp_connectors?: McpSelectionReceipt[];
+}
+
 export interface ToolCallBlock {
   stream_id: number;
   tool_name: string;
@@ -19,12 +99,22 @@ export interface Message {
   content: string;
   streaming?: boolean;
   tool_calls?: ToolCallBlock[];
+  mentioned_skills?: SkillSelectionReceipt[];
+  selected_mcp_connectors?: McpSelectionReceipt[];
 }
 
 export interface PersistedMessage {
   role: 'user' | 'assistant';
   content: string;
+  mentioned_skills?: SkillSelectionReceipt[];
+  selected_mcp_connectors?: McpSelectionReceipt[];
 }
+
+export type OutboundWsFrame =
+  | { type: 'new_chat' }
+  | { type: 'attach'; chat_id: string }
+  | { type: 'cancel'; chat_id: string }
+  | { type: 'message'; chat_id: string; content: string; metadata?: CapabilitySelections };
 
 export type WsConnectionState = 'connecting' | 'connected' | 'disconnected' | 'error';
 

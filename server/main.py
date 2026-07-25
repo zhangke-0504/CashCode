@@ -30,6 +30,7 @@ from app.api import health
 from app.api.sessions import router as sessions_router
 from app.api.skills import router as skills_router
 from app.api.skill_evolution import router as skill_evolution_router
+from app.api.mcp import router as mcp_router
 from app.bus.queue import MessageBus
 from app.agent.loop import SimpleAgentLoop
 from app.ws.channel import WebSocketChannel
@@ -37,6 +38,8 @@ from app.memory.dream import SimpleDream
 from app.paths import DataPaths
 from app.skills.store import SkillStore
 from app.skills.evolution import EvolutionService
+from app.mcp.service import MCPManagementService
+from app.mcp.store import MCPServerCatalog
 
 
 # ---------------------------------------------------------------------------
@@ -78,8 +81,20 @@ async def lifespan(app: FastAPI):
     paths = DataPaths.from_environment()
     paths.ensure()
     app.state.data_paths = paths
+    # 合并只读内置目录与用户目录；启动阶段只加载配置，不主动建立 MCP 连接。
+    project_root = Path(__file__).resolve().parent.parent
+    mcp_catalog = MCPServerCatalog(
+        project_root / "mcp_servers" / "mcp_config.json",
+        paths.mcp_servers,
+    )
     bus = MessageBus()
     agent = SimpleAgentLoop(bus, data_paths=paths)
+    agent.load_mcp_configs(mcp_catalog.runtime_configs(project_root))
+    # API 通过应用状态访问同一个 Agent，保证目录变更与实时工具状态一致。
+    app.state.agent = agent
+    app.state.mcp_service = MCPManagementService(
+        mcp_catalog, agent, project_root
+    )
     app.state.skill_catalog = agent.skill_catalog
     skill_store = SkillStore(agent.skill_catalog, paths.skill_snapshots)
     app.state.skill_store = skill_store
@@ -93,7 +108,7 @@ async def lifespan(app: FastAPI):
     app.state.skill_evolution = evolution
     agent.set_skill_evolution(evolution)
     ws_channel = WebSocketChannel(bus, host=ws_host, port=ws_port)
-    # Dream 复用 agent 的 client / model / store，无需额外初始化。
+    # Dream 复用 Agent 的模型客户端、模型名称和存储实例，无需额外初始化。
     dream = SimpleDream(agent._client, agent._model, agent._store)
 
     agent_task = asyncio.create_task(agent.run())
@@ -139,6 +154,7 @@ app.get("/api/health")(health)
 app.include_router(sessions_router, prefix="/api")
 app.include_router(skills_router, prefix="/api")
 app.include_router(skill_evolution_router, prefix="/api")
+app.include_router(mcp_router, prefix="/api")
 
 
 if __name__ == "__main__":

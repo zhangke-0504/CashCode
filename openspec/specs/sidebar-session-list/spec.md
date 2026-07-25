@@ -1,22 +1,35 @@
-## ADDED Requirements
+# Sidebar Session List Specification
+
+## Purpose
+Define session history navigation, conversation creation and management, and access to the MCP market from the sidebar.
+
+## Requirements
 
 ### Requirement: Display session list
-The system SHALL render all existing sessions in the sidebar as a scrollable list.
+The system SHALL render all existing sessions as a scrollable list beneath a collapsible `历史记录` control in the sidebar.
 
 #### Scenario: Sessions loaded
 - **WHEN** app loads and `GET /api/sessions` returns a list
-- **THEN** sidebar displays each session as a row with its title and relative timestamp
+- **THEN** the expanded history group displays each session as a row with its title and relative timestamp
 
 #### Scenario: Active session highlighted
 - **WHEN** user selects a session
-- **THEN** that session row is visually highlighted with a distinct background
+- **THEN** the application returns to chat view and that session row is visually highlighted with a distinct background
+
+#### Scenario: History group is collapsed
+- **WHEN** the user activates the expanded `历史记录` control
+- **THEN** the session rows are hidden without changing or detaching the active chat
+
+#### Scenario: History group is expanded
+- **WHEN** the user activates the collapsed `历史记录` control
+- **THEN** the existing session rows become visible again without another session being selected
 
 ### Requirement: Create new session
-The system SHALL allow the user to start a new conversation.
+The system SHALL retain a visible `新建对话` command and allow the user to start a new conversation from any main view.
 
 #### Scenario: New session created
-- **WHEN** user clicks the "+" button in the sidebar
-- **THEN** app sends `{"type": "new_chat"}` over WebSocket, receives `{"event": "attached", "chat_id": "..."}`, and switches to the new empty chat
+- **WHEN** user clicks `新建对话`
+- **THEN** app sends `{"type": "new_chat"}` over WebSocket, receives `{"event": "attached", "chat_id": "..."}`, switches to chat view, and displays the new empty chat
 
 ### Requirement: Rename session via context menu
 The system SHALL allow renaming a session through a hover context menu.
@@ -39,3 +52,14 @@ The system SHALL allow deleting a session through a hover context menu.
 #### Scenario: Delete active session
 - **WHEN** user deletes the currently active session
 - **THEN** app switches to the most recent remaining session, or shows an empty state if none remain
+
+### Requirement: Navigate to the MCP market
+The sidebar SHALL provide an `MCP 市场` navigation button separate from conversation creation and history expansion.
+
+#### Scenario: User opens MCP market
+- **WHEN** the user activates `MCP 市场`
+- **THEN** the main area renders the MCP market while preserving the active chat and history group state
+
+#### Scenario: User returns to a conversation
+- **WHEN** the market is open and the user selects a history row
+- **THEN** the application switches to chat view and attaches the selected session

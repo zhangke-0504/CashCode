@@ -28,8 +28,8 @@ from ..skills.tools import (
 )
 from .runner import SimpleAgentRunner
 from .tools.filesystem import EditFileTool, ListDirTool, ReadFileTool, WriteFileTool
-from .tools.mcp import MCPConnectionHandle, MCPToolWrapper, lazy_connect
-from .tools.mcp_cache import write_cache
+from .tools.mcp import MCPConnectionHandle, MCPToolWrapper, establish_mcp_sessions
+from .tools.mcp_cache import delete_cache, read_cache, write_cache
 from .tools.memory import SaveMemoryTool
 from .tools.registry import ToolRegistry
 from .tools.result import ToolExecutionResult
@@ -41,6 +41,7 @@ from .tools.tool_search import (
     MCPPrepareTool,
     ToolSearchTool,
     use_activated_set,
+    use_temporary_tools,
 )
 from .tools.web import WebFetchTool, WebSearchTool
 
@@ -105,6 +106,9 @@ class SimpleAgentLoop:
         self._deferred_registry = DeferredAwareRegistry(self._registry)
         self._mcp_config: dict[str, dict[str, Any]] = {}
         self._mcp_handles: dict[str, MCPConnectionHandle] = {}
+        self._mcp_tool_names: dict[str, set[str]] = {}
+        self._mcp_status: dict[str, dict[str, Any]] = {}
+        self._mcp_locks: dict[str, asyncio.Lock] = {}
 
         builtin_root = Path(__file__).resolve().parents[1] / "skills" / "builtin"
         self._skill_catalog = skill_catalog or SkillCatalog(
@@ -143,6 +147,9 @@ class SimpleAgentLoop:
         self._skill_evolution = service
 
     async def _setup_mcp(self) -> None:
+        if self._mcp_config:
+            self._skill_catalog.refresh()
+            return
         project_root = Path(__file__).resolve().parents[3]
         config_path = project_root / "mcp_servers" / "mcp_config.json"
         if not config_path.exists():
@@ -164,33 +171,259 @@ class SimpleAgentLoop:
                 for value in config.get("args", [])
             ]
         self._mcp_config.update(servers)
+        for name in servers:
+            self._mcp_status.setdefault(name, self._disconnected_mcp_status())
         self._skill_catalog.refresh()
 
     async def _prepare_mcp_server(self, server_name: str) -> bool:
+        status = await self.connect_mcp_server(server_name)
+        return status["status"] == "connected"
+
+    @staticmethod
+    def _disconnected_mcp_status(error: str | None = None) -> dict[str, Any]:
+        """构造未连接状态，并可附带清理阶段产生的有界错误。"""
+
+        return {
+            "status": "disconnected",
+            "status_error": error,
+            "tool_count": 0,
+        }
+
+    def load_mcp_configs(self, configs: dict[str, dict[str, Any]]) -> None:
+        """安装规范化启动配置，但不主动建立任何连接。"""
+
+        self._mcp_config.clear()
+        self._mcp_config.update(copy.deepcopy(configs))
+        self._mcp_status = {
+            name: self._disconnected_mcp_status() for name in self._mcp_config
+        }
+        self._skill_catalog.refresh()
+
+    def get_mcp_status(self, server_name: str) -> dict[str, Any]:
+        """结合状态记录和实际句柄，返回指定服务的权威生命周期状态。"""
+
+        status = dict(
+            self._mcp_status.get(server_name, self._disconnected_mcp_status())
+        )
+        handle = self._mcp_handles.get(server_name)
+        if handle is None or handle.session is None:
+            if status.get("status") == "connected":
+                status = self._disconnected_mcp_status("connection is no longer available")
+        else:
+            status["status"] = "connected"
+            status["status_error"] = None
+            status["tool_count"] = len(self._mcp_tool_names.get(server_name, ()))
+        return status
+
+    async def connect_mcp_server(self, server_name: str) -> dict[str, Any]:
+        """按服务名串行执行幂等连接，避免重复句柄和工具包装器。"""
+
+        lock = self._mcp_locks.setdefault(server_name, asyncio.Lock())
+        async with lock:
+            return await self._connect_mcp_server_unlocked(server_name)
+
+    async def _connect_mcp_server_unlocked(self, server_name: str) -> dict[str, Any]:
+        """在调用方持有服务锁时完成连接、握手、工具发现和状态发布。"""
+
         config = self._mcp_config.get(server_name)
         if config is None:
-            return False
-        if not await lazy_connect(server_name, config, self._mcp_handles):
-            return False
-        session = self._mcp_handles[server_name].session
-        if session is None:
-            return False
+            status = {
+                "status": "error",
+                "status_error": "MCP server is not configured",
+                "tool_count": 0,
+            }
+            self._mcp_status[server_name] = status
+            return dict(status)
+
+        existing = self._mcp_handles.get(server_name)
+        if existing is not None and existing.session is not None:
+            status = {
+                "status": "connected",
+                "status_error": None,
+                "tool_count": len(self._mcp_tool_names.get(server_name, ())),
+            }
+            self._mcp_status[server_name] = status
+            return dict(status)
+
+        await self._disconnect_mcp_server_unlocked(server_name, purge_activations=False)
+        self._mcp_status[server_name] = {
+            "status": "connecting",
+            "status_error": None,
+            "tool_count": 0,
+        }
+        errors: dict[str, str] = {}
+        handles = await establish_mcp_sessions(
+            {server_name: config}, errors_out=errors
+        )
+        handle = handles.get(server_name)
+        if handle is None or handle.session is None:
+            status = {
+                "status": "error",
+                "status_error": errors.get(server_name, "MCP connection failed")[:500],
+                "tool_count": 0,
+            }
+            self._mcp_status[server_name] = status
+            return dict(status)
+
+        session = handle.session
         try:
             result = await session.list_tools()
-        except Exception:
-            logger.warning("Failed to list tools for MCP '%s'", server_name, exc_info=True)
-            return False
+        except Exception as exc:
+            await handle.aclose()
+            status = {
+                "status": "error",
+                "status_error": f"{type(exc).__name__}: tool discovery failed"[:500],
+                "tool_count": 0,
+            }
+            self._mcp_status[server_name] = status
+            logger.warning("Failed to list tools for MCP '%s': %s", server_name, type(exc).__name__)
+            return dict(status)
+
         tools_data: list[dict[str, Any]] = []
+        wrappers: list[MCPToolWrapper] = []
         for definition in result.tools:
             wrapper = MCPToolWrapper(session, server_name, definition)
-            self._registry.register(wrapper)
+            wrappers.append(wrapper)
             tools_data.append({
                 "name": definition.name,
                 "description": definition.description or "",
                 "inputSchema": definition.inputSchema or {},
             })
+        # 工具发现全部成功后再一次性发布句柄和包装器，避免暴露半成品连接。
+        for wrapper in wrappers:
+            self._registry.register(wrapper)
+        self._mcp_handles[server_name] = handle
+        self._mcp_tool_names[server_name] = {wrapper.name for wrapper in wrappers}
         write_cache(server_name, config, tools_data)
-        return True
+        status = {
+            "status": "connected",
+            "status_error": None,
+            "tool_count": len(wrappers),
+        }
+        self._mcp_status[server_name] = status
+        return dict(status)
+
+    async def disconnect_mcp_server(
+        self, server_name: str, *, purge_activations: bool = True
+    ) -> dict[str, Any]:
+        """按服务名串行断开连接，并按需清除持久化激活引用。"""
+
+        lock = self._mcp_locks.setdefault(server_name, asyncio.Lock())
+        async with lock:
+            return await self._disconnect_mcp_server_unlocked(
+                server_name, purge_activations=purge_activations
+            )
+
+    async def _disconnect_mcp_server_unlocked(
+        self, server_name: str, *, purge_activations: bool
+    ) -> dict[str, Any]:
+        """在调用方持有服务锁时关闭句柄并注销该服务拥有的工具。"""
+
+        handle = self._mcp_handles.pop(server_name, None)
+        owned = self._mcp_tool_names.pop(server_name, set())
+        close_error: str | None = None
+        try:
+            if handle is not None:
+                await handle.aclose()
+        except Exception as exc:
+            close_error = f"{type(exc).__name__}: connection cleanup failed"[:500]
+            logger.warning("MCP '%s' cleanup failed: %s", server_name, type(exc).__name__)
+        finally:
+            # 即使传输关闭报错，也必须移除包装器和旧激活权限。
+            for tool_name in owned:
+                self._registry.unregister(tool_name)
+            if purge_activations and owned:
+                self._purge_activated_tools(owned)
+        status = self._disconnected_mcp_status(close_error)
+        self._mcp_status[server_name] = status
+        return dict(status)
+
+    async def replace_mcp_config(
+        self, server_name: str, config: dict[str, Any]
+    ) -> dict[str, Any]:
+        """断开旧连接、替换运行时配置并使工具缓存失效。"""
+
+        lock = self._mcp_locks.setdefault(server_name, asyncio.Lock())
+        async with lock:
+            await self._disconnect_mcp_server_unlocked(
+                server_name, purge_activations=True
+            )
+            self._mcp_config[server_name] = copy.deepcopy(config)
+            delete_cache(server_name)
+            self._skill_catalog.refresh()
+            status = self._disconnected_mcp_status()
+            self._mcp_status[server_name] = status
+            return dict(status)
+
+    async def remove_mcp_config(self, server_name: str) -> None:
+        """清理指定服务的连接、工具、缓存和 Skill 依赖状态。"""
+
+        lock = self._mcp_locks.setdefault(server_name, asyncio.Lock())
+        async with lock:
+            await self._disconnect_mcp_server_unlocked(
+                server_name, purge_activations=True
+            )
+            self._mcp_config.pop(server_name, None)
+            self._mcp_status.pop(server_name, None)
+            delete_cache(server_name)
+            self._skill_catalog.refresh()
+
+    def _purge_activated_tools(self, tool_names: set[str]) -> None:
+        """从已加载及磁盘会话元数据中清除精确工具名称。"""
+
+        # 先更新当前进程已加载的会话元数据。
+        for metadata in self._session_metadata.values():
+            activated = metadata.get("activated_tools")
+            if isinstance(activated, dict):
+                for tool_name in tool_names:
+                    activated.pop(tool_name, None)
+        # 再扫描持久化会话，防止同名服务重建后继承旧激活权限。
+        for chat_id in self._store.list_chat_ids():
+            metadata = self._store.read_session_metadata(chat_id)
+            activated = metadata.get("activated_tools")
+            if not isinstance(activated, dict):
+                continue
+            changed = False
+            for tool_name in tool_names:
+                if activated.pop(tool_name, None) is not None:
+                    changed = True
+            if changed:
+                self._store.write_session_metadata(chat_id, metadata)
+
+    def get_mcp_tools(self, server_name: str) -> dict[str, Any]:
+        """优先返回实时工具，否则返回传输指纹仍有效的只读缓存。"""
+
+        if server_name not in self._mcp_config:
+            return {"tools": [], "source": "none", **self.get_mcp_status(server_name)}
+        live: list[dict[str, Any]] = []
+        for tool_name in sorted(self._mcp_tool_names.get(server_name, ())):
+            wrapper = self._registry.get(tool_name)
+            if wrapper is None:
+                continue
+            live.append({
+                "name": tool_name,
+                "original_name": getattr(wrapper, "_original_name", tool_name),
+                "description": wrapper.description,
+                "input_schema": wrapper.parameters(),
+                "source": "live",
+                "callable": True,
+            })
+        if live:
+            return {"tools": live, "source": "live", **self.get_mcp_status(server_name)}
+        cached = read_cache(server_name, self._mcp_config[server_name]) or []
+        tools = [
+            {
+                "name": f"mcp_{server_name}_{item.get('name', '')}",
+                "original_name": item.get("name", ""),
+                "description": item.get("description", ""),
+                "input_schema": item.get("inputSchema") or {},
+                "source": "cache",
+                "callable": False,
+            }
+            for item in cached
+            if isinstance(item, dict) and item.get("name")
+        ]
+        return {"tools": tools, "source": "cache" if tools else "none", **self.get_mcp_status(server_name)}
 
     async def run(self) -> None:
         self._running = True
@@ -292,7 +525,23 @@ class SimpleAgentLoop:
         activated_tools = ActivatedToolSet.from_session(metadata)
         activated_skills = ActivatedSkillSet.from_session(metadata)
         skill_context = TurnSkillContext(activated_skills)
-        explicit_skill, task_content = parse_explicit_skill(message.content)
+        legacy_skill, task_content = parse_explicit_skill(message.content)
+        # 结构化选择与旧式开头 @Skill 语法在进入当前轮前统一去重。
+        selected_skill_rows = message.metadata.get("mentioned_skills", [])
+        selected_mcp_rows = message.metadata.get("selected_mcp_connectors", [])
+        selected_skills = [
+            row["name"]
+            for row in selected_skill_rows
+            if isinstance(row, dict) and isinstance(row.get("name"), str)
+        ]
+        if legacy_skill:
+            selected_skills.append(legacy_skill)
+        selected_skills = list(dict.fromkeys(selected_skills))
+        selected_mcp = list(dict.fromkeys(
+            row["server"]
+            for row in selected_mcp_rows
+            if isinstance(row, dict) and isinstance(row.get("server"), str)
+        ))
 
         soul = self._store.read_soul() or _DEFAULT_SOUL
         memory = self._store.read_memory()
@@ -315,10 +564,27 @@ class SimpleAgentLoop:
 
         try:
             with use_activated_set(activated_tools), use_skill_context(skill_context):
-                explicit_receipt: dict[str, Any] | None = None
-                if explicit_skill:
+                # 显式选择的 MCP 只为当前轮提供临时可见性，不写入会话激活集。
+                temporary_tools: set[str] = set()
+                for server_name in selected_mcp:
+                    status = await self.connect_mcp_server(server_name)
+                    if status["status"] != "connected":
+                        detail = status.get("status_error") or "connection failed"
+                        raise ValueError(
+                            f"Unable to prepare MCP {server_name}: {detail}"
+                        )
+                    owned = self._mcp_tool_names.get(server_name, set())
+                    if not owned:
+                        raise ValueError(
+                            f"Unable to use MCP {server_name}: no tools were discovered"
+                        )
+                    temporary_tools.update(owned)
+
+                explicit_receipts: list[dict[str, Any]] = []
+                selected_bodies: list[str] = []
+                for skill_name in selected_skills:
                     selected = ToolExecutionResult.coerce(
-                        await self._skill_load_tool.execute(name=explicit_skill)
+                        await self._skill_load_tool.execute(name=skill_name)
                     )
                     error = None
                     if selected.model_content.lstrip().startswith("{"):
@@ -327,20 +593,28 @@ class SimpleAgentLoop:
                         except json.JSONDecodeError:
                             pass
                     if error:
-                        raise ValueError(f"Unable to load @{explicit_skill}: {selected.model_content}")
+                        raise ValueError(f"Unable to load @{skill_name}: {selected.model_content}")
+                    selected_bodies.append(selected.model_content)
+                    explicit_receipts.append(
+                        {"role": "assistant", "content": selected.persisted}
+                    )
+                if selected_bodies:
                     messages.insert(1, {
                         "role": "system",
-                        "content": "The user explicitly selected this Skill:\n\n" + selected.model_content,
+                        "content": (
+                            "The user explicitly selected these Skills:\n\n"
+                            + "\n\n---\n\n".join(selected_bodies)
+                        ),
                     })
-                    explicit_receipt = {"role": "assistant", "content": selected.persisted}
-                trace = await self._runner.run(
-                    messages,
-                    self._deferred_registry,
-                    chat_id=chat_id,
-                    stream_id=stream_id,
-                )
-                if explicit_receipt:
-                    trace.durable_messages.insert(0, explicit_receipt)
+                with use_temporary_tools(temporary_tools):
+                    trace = await self._runner.run(
+                        messages,
+                        self._deferred_registry,
+                        chat_id=chat_id,
+                        stream_id=stream_id,
+                    )
+                if explicit_receipts:
+                    trace.durable_messages[0:0] = explicit_receipts
         except Exception as exc:
             logger.exception("Agent turn failed for chat_id=%s", chat_id)
             await self.bus.publish_outbound(OutboundMessage(
@@ -359,10 +633,19 @@ class SimpleAgentLoop:
         history.append({"role": "assistant", "content": trace.final_text})
         if trace.durable_messages:
             self._store.append_traced_turn(
-                chat_id, message.content, trace.durable_messages, trace.final_text
+                chat_id,
+                message.content,
+                trace.durable_messages,
+                trace.final_text,
+                user_metadata=message.metadata,
             )
         else:
-            self._store.append_turn(chat_id, message.content, trace.final_text)
+            self._store.append_turn(
+                chat_id,
+                message.content,
+                trace.final_text,
+                user_metadata=message.metadata,
+            )
         self._store.write_session_metadata(chat_id, metadata)
         if self._skill_evolution is not None:
             self._skill_evolution.schedule_turn(

@@ -1,15 +1,46 @@
-// Sidebar: session list with new, rename, delete
+// Sidebar: primary navigation and collapsible session history
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { MessageSquare, MoreHorizontal, Plus, Pencil, Trash2 } from 'lucide-react';
+import {
+  ChevronDown,
+  History,
+  MessageSquare,
+  MoreHorizontal,
+  Network,
+  Pencil,
+  Plus,
+  Trash2,
+} from 'lucide-react';
 import { useChatContext } from '../context/ChatContext';
 import { renameSession, deleteSession } from '../lib/api';
+import type { AppView } from '../types';
 
-export function Sidebar() {
+interface SidebarProps {
+  activeView: AppView;
+  mobileOpen: boolean;
+  onCloseMobile: () => void;
+  onViewChange: (view: AppView) => void;
+}
+
+function relativeTime(value: string): string {
+  const timestamp = new Date(value).getTime();
+  if (!Number.isFinite(timestamp)) return '';
+  const seconds = Math.max(0, Math.round((Date.now() - timestamp) / 1000));
+  if (seconds < 60) return '刚刚';
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `${minutes} 分钟前`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return `${hours} 小时前`;
+  const days = Math.floor(hours / 24);
+  return days < 30 ? `${days} 天前` : new Date(value).toLocaleDateString('zh-CN');
+}
+
+export function Sidebar({ activeView, mobileOpen, onCloseMobile, onViewChange }: SidebarProps) {
   const { state, send, dispatch, reloadSessions } = useChatContext();
   const { sessions, activeSessionId } = state;
   const [menuOpenFor, setMenuOpenFor] = useState<string | null>(null);
   const [renamingId, setRenamingId] = useState<string | null>(null);
   const [renameValue, setRenameValue] = useState('');
+  const [historyExpanded, setHistoryExpanded] = useState(true);
   const renameInputRef = useRef<HTMLInputElement>(null);
 
   // Close menu when clicking outside
@@ -25,10 +56,12 @@ export function Sidebar() {
   }, [renamingId]);
 
   const handleNewChat = () => {
+    onViewChange('chat');
     send({ type: 'new_chat' });
   };
 
   const handleSelectSession = (chat_id: string) => {
+    onViewChange('chat');
     if (chat_id === activeSessionId) return;
     dispatch({ type: 'SWITCH_SESSION', chat_id });
     send({ type: 'attach', chat_id });
@@ -70,24 +103,62 @@ export function Sidebar() {
   }, [dispatch, reloadSessions]);
 
   return (
-    <aside className="flex flex-col w-60 shrink-0 bg-[#111111] border-r border-zinc-800 h-full">
-      {/* New chat button */}
-      <div className="p-3">
+    <>
+      {mobileOpen && (
+        <button
+          type="button"
+          className="absolute inset-0 z-30 bg-black/65 sm:hidden"
+          onClick={onCloseMobile}
+          aria-label="关闭导航"
+        />
+      )}
+      <aside className={`absolute inset-y-0 left-0 z-40 flex h-full w-64 shrink-0 flex-col border-r border-zinc-800 bg-[#111111] transition-transform sm:static sm:translate-x-0 ${mobileOpen ? 'translate-x-0' : '-translate-x-full'}`}>
+      <div className="p-3 space-y-1">
         <button
           onClick={handleNewChat}
-          className="w-full flex items-center gap-2 px-3 py-2 rounded-lg text-sm text-zinc-300 hover:bg-zinc-800 transition-colors"
+          className="w-full flex items-center gap-2 px-3 py-2 rounded-md text-sm text-zinc-200 hover:bg-zinc-800 transition-colors"
         >
           <Plus className="w-4 h-4" />
-          新对话
+          新建对话
+        </button>
+        <button
+          onClick={() => onViewChange('mcp-market')}
+          aria-current={activeView === 'mcp-market' ? 'page' : undefined}
+          className={`w-full flex items-center gap-2 px-3 py-2 rounded-md text-sm transition-colors ${
+            activeView === 'mcp-market'
+              ? 'bg-zinc-800 text-zinc-100'
+              : 'text-zinc-300 hover:bg-zinc-800'
+          }`}
+        >
+          <Network className="w-4 h-4" />
+          MCP 市场
         </button>
       </div>
 
-      {/* Session list */}
-      <nav className="flex-1 overflow-y-auto px-2 pb-2">
-        {sessions.length === 0 && (
+      <div className="mx-3 border-t border-zinc-800" />
+      <button
+        type="button"
+        className="mx-2 mt-2 flex items-center gap-2 px-3 py-2 rounded-md text-xs font-medium text-zinc-500 hover:bg-zinc-800/70 hover:text-zinc-300 transition-colors"
+        aria-expanded={historyExpanded}
+        aria-controls="sidebar-history"
+        onClick={() => setHistoryExpanded((value) => !value)}
+      >
+        <History className="w-3.5 h-3.5" />
+        <span>历史记录</span>
+        <ChevronDown
+          className={`ml-auto w-3.5 h-3.5 transition-transform ${historyExpanded ? '' : '-rotate-90'}`}
+        />
+      </button>
+
+      <nav
+        id="sidebar-history"
+        aria-label="历史记录"
+        hidden={!historyExpanded}
+        className="flex-1 min-h-0 overflow-y-auto px-2 pb-2"
+      >
+        {sessions.length === 0 ? (
           <p className="text-xs text-zinc-600 px-2 py-4 text-center">暂无会话</p>
-        )}
-        {sessions.map((session) => (
+        ) : sessions.map((session) => (
           <div
             key={session.chat_id}
             className={`group relative flex items-center rounded-lg mb-0.5 cursor-pointer transition-colors ${
@@ -113,8 +184,11 @@ export function Sidebar() {
                 onClick={(e) => e.stopPropagation()}
               />
             ) : (
-              <span className="flex-1 ml-2 py-2 pr-6 text-sm truncate">
-                {session.title}
+              <span className="flex-1 min-w-0 ml-2 py-2 pr-7">
+                <span className="block text-sm truncate">{session.title}</span>
+                <span className="block mt-0.5 text-[11px] text-zinc-600 truncate">
+                  {relativeTime(session.updated_at)}
+                </span>
               </span>
             )}
 
@@ -123,6 +197,7 @@ export function Sidebar() {
               <button
                 className="absolute right-1 opacity-0 group-hover:opacity-100 p-1 rounded hover:bg-zinc-700 transition-all"
                 onClick={(e) => openMenu(e, session.chat_id)}
+                aria-label={`管理会话 ${session.title}`}
               >
                 <MoreHorizontal className="w-3.5 h-3.5" />
               </button>
@@ -153,6 +228,7 @@ export function Sidebar() {
           </div>
         ))}
       </nav>
-    </aside>
+      </aside>
+    </>
   );
 }

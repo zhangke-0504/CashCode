@@ -33,10 +33,11 @@ from websockets.exceptions import ConnectionClosed
 
 from ..bus.events import InboundMessage, OutboundMessage
 from ..bus.queue import MessageBus
+from ..selections import SelectionValidationError, sanitize_selection_metadata
 
 logger = logging.getLogger(__name__)
 
-# chat_id 必须是简短且安全的标识符（UUID 或带作用域的键）。
+# 会话标识必须简短且安全，可以是 UUID 或带作用域的键。
 _CHAT_ID_RE = re.compile(r"^[A-Za-z0-9_:-]{1,64}$")
 
 
@@ -72,9 +73,9 @@ class WebSocketChannel:
         self.host = host
         self.port = port
 
-        # chat_id → 订阅该会话的连接集合
+        # 会话标识映射到订阅该会话的连接集合。
         self._subs: dict[str, set[Any]] = {}
-        # connection → 该连接订阅的 chat_id 集合（便于断开时快速清理）
+        # 连接映射到其订阅的会话标识集合，便于断开时快速清理。
         self._conn_chats: dict[Any, set[str]] = {}
 
         self._stop_event: asyncio.Event | None = None
@@ -193,7 +194,7 @@ class WebSocketChannel:
             if not _is_valid_chat_id(cid):
                 await self._send(conn, {"event": "error", "detail": "invalid chat_id"})
                 return
-            # 发布 /stop 信号，使 Agent 可以取消仍在执行的对话轮次。
+            # 发布停止信号，使 Agent 可以取消仍在执行的对话轮次。
             await self.bus.publish_inbound(InboundMessage(
                 channel="websocket",
                 sender_id=client_id,
@@ -212,13 +213,20 @@ class WebSocketChannel:
             if not isinstance(content, str) or not content.strip():
                 await self._send(conn, {"event": "error", "detail": "missing content"})
                 return
-            # 自动订阅，使客户端可以省略单独的 attach 帧。
+            # 选择元数据来自客户端，必须在进入消息总线前完成结构和数量校验。
+            try:
+                metadata = sanitize_selection_metadata(envelope.get("metadata"))
+            except SelectionValidationError as exc:
+                await self._send(conn, {"event": "error", "detail": str(exc)})
+                return
+            # 自动订阅，使客户端可以省略单独的附加会话帧。
             self._attach(conn, cid)
             await self.bus.publish_inbound(InboundMessage(
                 channel="websocket",
                 sender_id=client_id,
                 chat_id=str(cid),
                 content=content,
+                metadata=metadata,
             ))
             return
 
