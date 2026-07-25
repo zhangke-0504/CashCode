@@ -1,7 +1,7 @@
 // MessageBubble: renders user or assistant messages
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
-import { Check, Copy } from 'lucide-react';
+import { Check, Copy, Network, Sparkles } from 'lucide-react';
 import { useState } from 'react';
 import type { Message } from '../types';
 import { ToolProgressBlock } from './ToolProgressBlock';
@@ -31,10 +31,31 @@ export function MessageBubble({ message }: MessageBubbleProps) {
   const isUser = message.role === 'user';
 
   if (isUser) {
+    const hasReferences = Boolean(
+      message.mentioned_skills?.length || message.selected_mcp_connectors?.length,
+    );
     return (
       <div className="flex justify-end px-4 py-1">
-        <div className="max-w-[75%] bg-zinc-700 text-zinc-100 px-4 py-2.5 rounded-2xl rounded-tr-sm text-sm leading-relaxed whitespace-pre-wrap">
-          {message.content}
+        <div className="flex max-w-[90%] min-w-0 flex-col items-end gap-1.5 sm:max-w-[75%]">
+          {hasReferences && (
+            <div className="flex max-w-full flex-wrap justify-end gap-1" aria-label="本条消息使用的能力">
+              {message.mentioned_skills?.map((skill) => (
+                <span key={`skill:${skill.name}`} className="inline-flex max-w-full items-center gap-1 rounded border border-amber-800/60 bg-amber-950/30 px-1.5 py-0.5 text-[11px] text-amber-300">
+                  <Sparkles className="h-3 w-3 shrink-0" />
+                  <span className="truncate">{skill.label || skill.name}</span>
+                </span>
+              ))}
+              {message.selected_mcp_connectors?.map((mcp) => (
+                <span key={`mcp:${mcp.server}`} className="inline-flex max-w-full items-center gap-1 rounded border border-cyan-800/60 bg-cyan-950/30 px-1.5 py-0.5 text-[11px] text-cyan-300">
+                  <Network className="h-3 w-3 shrink-0" />
+                  <span className="truncate">{mcp.label || mcp.server}</span>
+                </span>
+              ))}
+            </div>
+          )}
+          <div className="max-w-full whitespace-pre-wrap break-words rounded-2xl rounded-tr-sm bg-zinc-700 px-4 py-2.5 text-sm leading-relaxed text-zinc-100">
+            {message.content}
+          </div>
         </div>
       </div>
     );

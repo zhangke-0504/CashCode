@@ -1,11 +1,11 @@
 # -*- coding: utf-8 -*-
-"""MCP 工具 schema 磁盘缓存（简化版）。
+"""MCP 工具结构的磁盘缓存（简化版）。
 
-参考 spore ``core.agent.tools.mcp_cache``，去掉公司 catalog 版本管理，
-只保留 transport fingerprint 失效机制。
+参考 spore ``core.agent.tools.mcp_cache``，去掉企业目录版本管理，
+只保留传输指纹失效机制。
 
 缓存文件：<project_root>/mcp_cache/<server_name>.json
-缓存 key ：sha256(command+args+env+url)[:16]
+缓存键：sha256(command+args+env+url)[:16]
 """
 from __future__ import annotations
 
@@ -20,7 +20,7 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
-# 项目根目录（mcp_cache.py: server/app/agent/tools/ → 上4级）
+# 项目根目录（从 server/app/agent/tools/ 向上四级）。
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent.parent
 _CACHE_DIR = _PROJECT_ROOT / "mcp_cache"
 
@@ -31,7 +31,7 @@ def _cache_path(server_name: str) -> Path:
 
 
 def compute_transport_fingerprint(config: dict) -> str:
-    """计算 server 配置的传输指纹（command+args+env+url 的 sha256 前16位）。"""
+    """计算服务配置的传输指纹，即关键连接字段哈希值的前 16 位。"""
     relevant = {
         "command": config.get("command", ""),
         "args":    config.get("args", []),
@@ -43,7 +43,7 @@ def compute_transport_fingerprint(config: dict) -> str:
 
 
 def read_cache(server_name: str, config: dict) -> list[dict[str, Any]] | None:
-    """读取缓存。fingerprint 不匹配或文件不存在时返回 None。"""
+    """读取缓存；传输指纹不匹配或文件不存在时返回 None。"""
     path = _cache_path(server_name)
     if not path.exists():
         return None
@@ -70,7 +70,7 @@ def write_cache(
     resources: list[dict[str, Any]] | None = None,
     prompts: list[dict[str, Any]] | None = None,
 ) -> None:
-    """原子写入工具 schema 缓存。"""
+    """原子写入工具结构缓存。"""
     _CACHE_DIR.mkdir(parents=True, exist_ok=True)
     path = _cache_path(server_name)
     data: dict[str, Any] = {
@@ -90,3 +90,12 @@ def write_cache(
             tmp.unlink(missing_ok=True)
         except OSError:
             pass
+
+
+def delete_cache(server_name: str) -> None:
+    """配置被替换或删除后，移除对应服务的工具缓存。"""
+
+    try:
+        _cache_path(server_name).unlink(missing_ok=True)
+    except OSError:
+        logger.warning("mcp_cache: failed to remove cache for '%s'", server_name)

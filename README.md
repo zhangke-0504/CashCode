@@ -12,7 +12,7 @@ CashCode 是一个本地运行的个人 AI Agent 框架，支持跨会话持久�
 | 记忆体系 | 跨会话持久化、上下文压缩、长期记忆提炼 |
 | 工具调用 | ReAct 循环、内置工具与动态工具 |
 | Agent 人格 | SOUL.md 驱动的可配置身份 |
-| MCP 体系 | 延迟激活、BM25工具搜索、stdio/SSE双传输 |
+| MCP 体系 | 内置/用户目录、市场管理、显式连接、延迟激活、stdio/SSE 传输 |
 | Skill 体系 | 自然语言搜索、两阶段懒加载、Session 摘要、管理 API、自进化提案 |
 
 ---
@@ -75,7 +75,8 @@ CashCode/
 │   ├── main.py                    # FastAPI + WebSocket 服务入口
 │   ├── .env                       # 环境变量配置
 │   ├── requirements.txt
-│   ├── data/                      # Skill 与自进化运行数据（不提交 git）
+│   ├── data/                      # Skill、用户 MCP 与自进化运行数据（不提交 git）
+│   │   └── mcp/servers.json       # 用户创建的 SSE MCP 配置
 │   ├── memory/                    # 运行时记忆数据（不提交 git）
 │   │   ├── SOUL.md                # Agent 人格文件（提交 git）
 │   │   ├── MEMORY.md              # 全局长期记忆（运行时生成）
@@ -106,6 +107,7 @@ CashCode/
 │       │   └── builtin/           # 只读内置 Skill
 │       ├── api/
 │       │   ├── skills.py          # Skill 管理 API
+│       │   ├── mcp.py             # MCP 市场、CRUD 与连接 API
 │       │   └── skill_evolution.py # Skill 自进化提案 API
 │       ├── memory/
 │       │   ├── store.py           # MemoryStore（含 session metadata）
@@ -138,6 +140,7 @@ CashCode/
 
 ```json
 {"type": "message", "chat_id": "uuid", "content": "用户消息"}
+{"type": "message", "chat_id": "uuid", "content": "检查仓库", "metadata": {"mentioned_skills": [{"name": "code-review", "label": "代码审查"}], "selected_mcp_connectors": [{"server": "github", "label": "GitHub"}]}}
 {"type": "ping"}
 {"type": "new_chat"}
 {"type": "attach", "chat_id": "uuid"}
@@ -315,6 +318,31 @@ class Tool(ABC):
 ## 四、MCP 体系
 
 CashCode 实现了完整的 MCP（Model Context Protocol）体系，支持将外部 MCP server 的工具无缝接入 Agent。
+
+### MCP 市场与配置来源
+
+左侧栏的 `MCP 市场` 会合并显示两类配置：
+
+- `mcp_servers/mcp_config.json` 是随项目提供的只读内置目录，支持 stdio 和 SSE；市场中标记为 `内置`，允许连接或断开，但不能编辑、删除。
+- `CASHCODE_DATA_DIR/mcp/servers.json` 是用户目录，默认位于 `server/data/mcp/servers.json`；用户可以在市场中新建、编辑和删除，目前只支持 SSE。
+
+用户 MCP 包含内部名称、显示标题、描述、HTTP(S) SSE 地址和可选 Headers。Headers 的实际值保存在本地用户数据文件中，不承诺静态加密；API 和编辑表单只返回 `********`，提交该占位符会保留原值。连接错误、工具信息与聊天历史不会返回 Header 值。
+
+新建或编辑配置不会自动连接。点击 `连接` 后，服务端完成传输握手和 `list_tools` 才会显示为已连接；`断开` 会关闭传输并移除该服务拥有的实时工具。连接失败会在市场中显示可重试的脱敏错误。
+
+| API | 说明 |
+|---|---|
+| `GET/POST /api/mcp/servers` | 查询合并目录或创建用户 SSE MCP |
+| `PUT/DELETE /api/mcp/servers/{name}` | 编辑或删除用户 MCP；内置项返回 403 |
+| `POST /api/mcp/servers/{name}/connect` | 显式连接并发现工具 |
+| `POST /api/mcp/servers/{name}/disconnect` | 显式断开并清理实时工具 |
+| `GET /api/mcp/servers/{name}/tools` | 查询实时工具或配置指纹有效的缓存信息 |
+
+### 在聊天中选择 MCP 或 Skill
+
+在聊天输入框的词元边界输入 `@`，先选择 `MCP` 或 `Skill`，再从当前可用列表中搜索并选择。MCP 列表只包含已连接且发现了实时工具的服务，Skill 列表只包含已启用且依赖可用的 Skill。选择结果显示为可移除芯片，一条消息最多合计选择 8 项，正文不能为空。
+
+选择通过 WebSocket 结构化 metadata 发送，不会拼接到任务正文。显式选择的 MCP 工具权限只对当前轮生效，但市场建立的传输会保持连接，直到用户断开、编辑、删除或服务退出。Skill/MCP 引用会随用户消息写入历史并在重新打开会话后恢复。开头的旧式 `@<skill>` 文本语法仍保留兼容。
 
 ### 核心设计：延迟激活（Deferred Activation）
 
@@ -567,7 +595,7 @@ cp .env.example .env  # 填入 DEEPSEEK_API_KEY
 ```ini
 DEEPSEEK_API_KEY=your_key_here
 DEEPSEEK_API_BASE=https://api.deepseek.com
-DEEPSEEK_MODEL=deepseek-chat
+DEEPSEEK_MODEL= deepseek-v4-flash
 
 WS_HOST=127.0.0.1
 WS_PORT=8765
@@ -587,6 +615,7 @@ python main.py
 - HTTP API：`http://127.0.0.1:8000`
 - WebSocket：`ws://127.0.0.1:8765`
 - MCP server 按需连接（lazy mode），首次使用时由 Agent 自动触发
+- 也可在前端 `MCP 市场` 中显式连接或断开
 - Dream 后台任务每5分钟运行一次
 
 ### 使用 SSE MCP Server（可选）
@@ -641,7 +670,9 @@ cd client && npm install && npm run dev
 
 ### 前端功能
 
-- 会话列表侧边栏（新建 / 重命名 / 删除）
+- 侧边栏导航（新建对话 / MCP 市场 / 可折叠历史记录）
+- MCP 市场（内置标识、用户 SSE 配置、Headers、连接 / 断开 / 编辑 / 删除）
+- 聊天框两级 `@` 选择器与 Skill/MCP 引用芯片
 - 流式聊天消息（Markdown 渲染，含代码高亮和表格）
 - 工具调用进度显示（spinner → 结果预览）
 - WebSocket 自动重连

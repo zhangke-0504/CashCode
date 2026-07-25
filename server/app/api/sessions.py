@@ -14,8 +14,8 @@ from ..memory.store import MemoryStore
 
 router = APIRouter()
 
-# 与 main.py 中 agent 共享同一个 MemoryStore 根目录。
-# 此处使用独立实例（只读/写 metadata，不影响 agent 内存缓存）。
+# 与 main.py 中 Agent 共享同一个 MemoryStore 根目录。
+# 此处使用独立实例，只读写会话元数据，不影响 Agent 的内存缓存。
 _SERVER_ROOT = Path(__file__).resolve().parents[2]
 _store = MemoryStore(
     Path(os.environ.get("MEMORY_DIR", str(_SERVER_ROOT / "memory"))).resolve()
@@ -42,16 +42,13 @@ async def list_sessions() -> dict[str, Any]:
 
 @router.get("/sessions/{chat_id}/messages")
 async def get_session_messages(chat_id: str) -> dict[str, Any]:
-    """Return persisted user and assistant messages for a session."""
+    """返回会话中持久化的用户、助手消息及安全的能力选择收据。"""
+
     chat_dir = _store.base_dir / chat_id
     if not chat_dir.is_dir():
         raise HTTPException(status_code=404, detail="session not found")
 
-    messages = [
-        {"role": message["role"], "content": message.get("content", "")}
-        for message in _store.load_history(chat_id)
-        if message.get("role") in ("user", "assistant")
-    ]
+    messages = _store.load_public_history(chat_id)
     return {"chat_id": chat_id, "messages": messages}
 
 

@@ -52,10 +52,12 @@ export function useWebSocket(onFrame: (frame: unknown) => void) {
     };
   }, [connect]);
 
-  const send = useCallback((frame: object) => {
+  const send = useCallback((frame: object): boolean => {
     if (wsRef.current?.readyState === WebSocket.OPEN) {
       wsRef.current.send(JSON.stringify(frame));
+      return true;
     }
+    return false;
   }, []);
 
   return { state, send };

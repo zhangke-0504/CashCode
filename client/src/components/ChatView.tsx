@@ -1,5 +1,5 @@
 // ChatView: main chat area with messages and composer
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { ArrowDown } from 'lucide-react';
 import { useChatContext } from '../context/ChatContext';
 import { MessageBubble } from './MessageBubble';
@@ -9,7 +9,10 @@ export function ChatView() {
   const { state } = useChatContext();
   const { activeSessionId, messages } = state;
 
-  const activeMessages = activeSessionId ? (messages[activeSessionId] ?? []) : [];
+  const activeMessages = useMemo(
+    () => activeSessionId ? (messages[activeSessionId] ?? []) : [],
+    [activeSessionId, messages],
+  );
   const bottomRef = useRef<HTMLDivElement>(null);
   const scrollContainerRef = useRef<HTMLDivElement>(null);
   const [showScrollBtn, setShowScrollBtn] = useState(false);

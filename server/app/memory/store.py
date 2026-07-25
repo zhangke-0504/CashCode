@@ -18,6 +18,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from ..selections import safe_persisted_selections
+
 logger = logging.getLogger(__name__)
 
 
@@ -30,7 +32,7 @@ class MemoryStore:
 
     def __init__(self, base_dir: Path) -> None:
         """
-        Args:
+        参数：
             base_dir: 所有 chat_id 子目录的根目录，例如 Path("memory")。
                       目录本身在首次写入时按需创建，此处不预建。
         """
@@ -53,7 +55,7 @@ class MemoryStore:
         return self._chat_dir(chat_id) / ".cursor"
 
     # ------------------------------------------------------------------
-    # cursor 管理
+    # 游标管理
     # ------------------------------------------------------------------
 
     def _next_cursor(self, chat_id: str) -> int:
@@ -86,6 +88,7 @@ class MemoryStore:
         chat_id: str,
         user_content: str,
         assistant_content: str,
+        user_metadata: dict[str, Any] | None = None,
     ) -> None:
         """将一轮对话（user + assistant）追加到 history.jsonl。
 
@@ -100,6 +103,7 @@ class MemoryStore:
             "timestamp": ts,
             "role": "user",
             "content": user_content,
+            **safe_persisted_selections(user_metadata or {}),
         }
         assistant_record = {
             "cursor": assistant_cursor,
@@ -169,19 +173,19 @@ class MemoryStore:
             final_reply: LLM 最终文字回复
         """
         ts = datetime.now().strftime("%Y-%m-%d %H:%M")
-        # 预先计算所有 cursor 值（user + tool_calls + N tool_results + assistant）
-        n_records = 3 + len(tool_results)  # user + tool_calls + results + assistant
+        # 预先计算用户、工具调用、工具结果和助手消息所需的全部游标值。
+        n_records = 3 + len(tool_results)  # 固定三条消息，加上每一条工具结果。
         first_cursor = self._next_cursor(chat_id)
         cursors = list(range(first_cursor, first_cursor + n_records))
 
         # 构建所有记录
         records: list[dict[str, Any]] = []
 
-        # user
+        # 用户消息。
         records.append({
             "cursor": cursors[0], "timestamp": ts, "role": "user", "content": user_content,
         })
-        # tool_calls（assistant 发起工具调用的消息）
+        # 助手发起工具调用的消息。
         tool_calls_record: dict[str, Any] = {
             "cursor": cursors[1],
             "timestamp": ts,
@@ -190,7 +194,7 @@ class MemoryStore:
             "tool_calls": tool_calls_msg.get("tool_calls", []),
         }
         records.append(tool_calls_record)
-        # tool_result(s)
+        # 一条或多条工具结果。
         for i, tr in enumerate(tool_results):
             records.append({
                 "cursor": cursors[2 + i],
@@ -199,7 +203,7 @@ class MemoryStore:
                 "content": tr.get("content", ""),
                 "tool_call_id": tr.get("tool_call_id", ""),
             })
-        # assistant 最终回复
+        # 助手最终回复。
         records.append({
             "cursor": cursors[-1], "timestamp": ts, "role": "assistant", "content": final_reply,
         })
@@ -229,11 +233,16 @@ class MemoryStore:
         user_content: str,
         durable_messages: list[dict[str, Any]],
         final_reply: str,
+        user_metadata: dict[str, Any] | None = None,
     ) -> None:
         """持久化一个完整工具调用 Turn 中的所有耐久消息。"""
         ts = datetime.now().strftime("%Y-%m-%d %H:%M")
         payloads: list[dict[str, Any]] = [
-            {"role": "user", "content": user_content}
+            {
+                "role": "user",
+                "content": user_content,
+                **safe_persisted_selections(user_metadata or {}),
+            }
         ]
         for message in durable_messages:
             role = message.get("role")
@@ -306,9 +315,9 @@ class MemoryStore:
                     if role in ("user", "assistant") and content:
                         messages.append({"role": role, "content": content})
                     elif role == "summary" and content:
-                        # 摘要记录映射为 assistant 消息，加前缀让 LLM 知晓这是压缩内容。
+                        # 摘要记录映射为助手消息，加前缀让模型知晓这是压缩内容。
                         messages.append({"role": "assistant", "content": f"[历史摘要] {content}"})
-                    # 未知 role 静默跳过，保持向前兼容
+                    # 未知角色静默跳过，保持向前兼容。
         except OSError:
             logger.exception("MemoryStore: failed to read %s", history_file)
             return []
@@ -316,6 +325,23 @@ class MemoryStore:
         logger.debug(
             "MemoryStore: loaded %d messages for chat_id=%s", len(messages), chat_id
         )
+        return messages
+
+    def load_public_history(self, chat_id: str) -> list[dict[str, Any]]:
+        """返回用户和助手消息，并附带仅用于展示的安全选择收据。"""
+
+        messages: list[dict[str, Any]] = []
+        for entry in self._read_raw_entries(chat_id):
+            role = entry.get("role")
+            if role not in ("user", "assistant"):
+                continue
+            content = entry.get("content", "")
+            if not isinstance(content, str):
+                content = str(content or "")
+            item: dict[str, Any] = {"role": role, "content": content}
+            if role == "user":
+                item.update(safe_persisted_selections(entry))
+            messages.append(item)
         return messages
 
     def read_unprocessed_history(
@@ -373,7 +399,7 @@ class MemoryStore:
     def load_history_smart(
         self, chat_id: str
     ) -> tuple[list[dict[str, Any]], int]:
-        """Smart Load：基于 keep_from_cursor 元数据正确恢复 to_keep 消息。
+        """智能加载：基于 keep_from_cursor 元数据正确恢复待保留消息。
 
         加载策略（按优先级）：
         1. 找到最后一条 summary，读取其 keep_from_cursor 字段
@@ -388,14 +414,14 @@ class MemoryStore:
         if not raw:
             return [], 0
 
-        # 找到最后一条 summary 及其元数据
+        # 找到最后一条摘要及其元数据。
         last_summary_entry: dict[str, Any] | None = None
         for e in raw:
             if e.get("role") == "summary":
                 last_summary_entry = e
 
         if last_summary_entry is None:
-            # 没有 summary 时全量加载，此时尚未发生上下文压缩。
+            # 没有摘要时全量加载，此时尚未发生上下文压缩。
             messages: list[dict[str, Any]] = []
             for e in raw:
                 if e.get("role") == "summary":
@@ -416,27 +442,27 @@ class MemoryStore:
         keep_from_cursor = last_summary_entry.get("keep_from_cursor")  # 新格式元数据
 
         messages = []
-        # 先加载 summary 作为前缀
+        # 先加载摘要作为前缀。
         summary_content = last_summary_entry.get("content", "")
         if summary_content:
             messages.append({"role": "assistant", "content": f"[历史摘要] {summary_content}"})
 
-        # 加载 to_keep 消息
+        # 加载压缩后需要保留的消息。
         for e in raw:
             role = e.get("role")
             if role == "summary":
-                continue  # 跳过所有 summary（包括已单独加载的最后一条）
+                continue  # 跳过所有摘要，包括已单独加载的最后一条。
             content = e.get("content", "")
             cursor = e.get("cursor", 0)
 
             if keep_from_cursor is not None:
-                # 新格式：keep_from_cursor 精确标记保留边界
+                # 新格式：keep_from_cursor 精确标记保留边界。
                 if cursor >= keep_from_cursor:
                     msg = _entry_to_message(e)
                     if msg:
                         messages.append(msg)
             else:
-                # 旧格式兜底：只加载 summary 之后写入的条目
+                # 旧格式兜底：只加载摘要之后写入的条目。
                 if cursor > summary_cursor:
                     msg = _entry_to_message(e)
                     if msg:
@@ -466,7 +492,7 @@ class MemoryStore:
         return int(cursor) if cursor is not None else None
 
     # ------------------------------------------------------------------
-    # 全局记忆（MEMORY.md）与 Dream cursor
+    # 全局记忆（MEMORY.md）与 Dream 游标
     # ------------------------------------------------------------------
 
     def read_memory(self) -> str:
@@ -545,11 +571,11 @@ class MemoryStore:
                 continue
             chat_id = d.name
 
-            # 读取 metadata
+            # 读取会话元数据。
             meta = self.read_session_metadata(chat_id)
             title: str = meta.get("title") or "新对话"
 
-            # updated_at：优先取 history.jsonl mtime
+            # 更新时间优先采用 history.jsonl 的文件修改时间。
             history_file = d / "history.jsonl"
             if history_file.exists():
                 mtime = history_file.stat().st_mtime
@@ -569,7 +595,7 @@ class MemoryStore:
         return sessions
 
     # ------------------------------------------------------------------
-    # Session metadata（V2 新增：供 ActivatedToolSet 等跨轮次状态存储使用）
+    # 会话元数据（V2 新增：供 ActivatedToolSet 等跨轮次状态存储使用）
     # ------------------------------------------------------------------
 
     def _metadata_file(self, chat_id: str) -> Path:
@@ -645,7 +671,7 @@ def _entry_to_message(entry: dict[str, Any]) -> dict[str, Any] | None:
         return {"role": "assistant", "content": content}
 
     if role == "tool_calls":
-        # 恢复发起工具调用的 assistant 消息。
+        # 恢复发起工具调用的助手消息。
         tool_calls = entry.get("tool_calls")
         if tool_calls:
             return {
@@ -666,7 +692,7 @@ def _entry_to_message(entry: dict[str, Any]) -> dict[str, Any] | None:
             }
         return None
 
-    # 跳过 summary 和未知角色等记录。
+    # 跳过摘要和未知角色等记录。
     return None
 
 
