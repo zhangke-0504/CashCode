@@ -6,7 +6,8 @@ export interface Session {
   updated_at: string;
 }
 
-export type AppView = 'chat' | 'mcp-market';
+export const APP_VIEWS = ['chat', 'mcp-market', 'skill-market'] as const;
+export type AppView = (typeof APP_VIEWS)[number];
 
 export type McpLifecycleStatus = 'disconnected' | 'connecting' | 'connected' | 'error';
 export type McpTransport = 'sse' | 'stdio';
@@ -59,6 +60,7 @@ export interface McpToolsResponse {
 
 export interface SkillSummary {
   name: string;
+  display_name: string;
   description: string;
   version: number;
   tags: string[];
@@ -69,6 +71,58 @@ export interface SkillSummary {
   availability: 'available' | 'missing_dependency' | 'disabled' | 'invalid';
   missing: string[];
   mutable: boolean;
+  hash: string;
+  shadowed_sources: string[];
+  validation_errors: string[];
+  requires: SkillDependencies;
+  optional: SkillDependencies;
+}
+
+export interface SkillDependencies {
+  tools: string[];
+  mcp_servers: string[];
+  bins: string[];
+  env: string[];
+}
+
+export interface SkillListResponse {
+  items: SkillSummary[];
+  total: number;
+  page: number;
+  page_size: number;
+  invalid: Record<string, string[]>;
+}
+
+export interface SkillInvalidDiagnostic {
+  key: string;
+  source: SkillSummary['source'];
+  directory: string;
+  errors: string[];
+  selectable: false;
+  manageable: false;
+}
+
+export interface SkillListParams {
+  source?: SkillSummary['source'];
+  enabled?: boolean;
+  availability?: SkillSummary['availability'];
+  query?: string;
+  page?: number;
+  page_size?: number;
+}
+
+export interface SkillContent {
+  name: string;
+  display_name: string;
+  content: string;
+  hash: string;
+  source: SkillSummary['source'];
+  mutable: boolean;
+}
+
+export interface SkillReplaceRequest {
+  content: string;
+  expected_hash: string;
 }
 
 export interface SkillSelectionReceipt {

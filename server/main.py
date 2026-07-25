@@ -36,7 +36,6 @@ from app.agent.loop import SimpleAgentLoop
 from app.ws.channel import WebSocketChannel
 from app.memory.dream import SimpleDream
 from app.paths import DataPaths
-from app.skills.store import SkillStore
 from app.skills.evolution import EvolutionService
 from app.mcp.service import MCPManagementService
 from app.mcp.store import MCPServerCatalog
@@ -96,13 +95,12 @@ async def lifespan(app: FastAPI):
         mcp_catalog, agent, project_root
     )
     app.state.skill_catalog = agent.skill_catalog
-    skill_store = SkillStore(agent.skill_catalog, paths.skill_snapshots)
-    app.state.skill_store = skill_store
+    app.state.skill_store = agent.skill_store
     evolution = EvolutionService(
         agent._client,
         agent._model,
         agent.skill_catalog,
-        skill_store,
+        agent.skill_store,
         paths.skill_evolution,
     )
     app.state.skill_evolution = evolution

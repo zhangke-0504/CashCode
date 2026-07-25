@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import unicodedata
 from pathlib import Path
 from typing import Any
 
@@ -18,6 +19,10 @@ SKILL_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
 FRONTMATTER_RE = re.compile(r"\A---\s*\r?\n(.*?)\r?\n---\s*\r?\n?", re.DOTALL)
 MAX_SKILL_BYTES = 80_000
 MAX_SUPPORT_BYTES = 200_000
+MAX_SKILL_ZIP_BYTES = 10 * 1024 * 1024
+MAX_SKILL_ARCHIVE_ENTRIES = 256
+MAX_SKILL_ARCHIVE_EXPANDED_BYTES = 20 * 1024 * 1024
+MAX_DISPLAY_NAME_CHARS = 80
 
 
 def validate_name(name: str) -> str:
@@ -25,6 +30,21 @@ def validate_name(name: str) -> str:
     if not SKILL_NAME_RE.fullmatch(value):
         raise SkillError("invalid Skill name; use lowercase letters, numbers, dots, underscores, and hyphens")
     return value
+
+
+def validate_display_name(value: Any) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise SkillError("display_name must be a string")
+    display_name = value.strip()
+    if not display_name:
+        raise SkillError("display_name cannot be empty")
+    if len(display_name) > MAX_DISPLAY_NAME_CHARS:
+        raise SkillError(f"display_name must be at most {MAX_DISPLAY_NAME_CHARS} characters")
+    if any(unicodedata.category(character).startswith("C") for character in display_name):
+        raise SkillError("display_name cannot contain control characters")
+    return display_name
 
 
 def safe_child(root: Path, relative: str | Path) -> Path:
@@ -107,6 +127,7 @@ def parse_skill_text(content: str, *, expected_name: str | None = None) -> tuple
     manifest = SkillManifest(
         name=name,
         description=description,
+        display_name=validate_display_name(raw.get("display_name")),
         version=version,
         tags=_string_list(raw.get("tags"), "tags"),
         triggers=_string_list(raw.get("triggers"), "triggers"),

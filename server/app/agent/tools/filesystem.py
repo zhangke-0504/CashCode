@@ -7,7 +7,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 
 from .base import Tool
 
@@ -23,6 +23,19 @@ def _safe_path(workspace: Path, path: str) -> Path:
     except ValueError:
         raise PermissionError(f"路径 {path!r} 超出工作目录，拒绝访问")
     return resolved
+
+
+def _protected_root_error(path: Path, roots: Iterable[Path]) -> str | None:
+    for root in roots:
+        try:
+            path.relative_to(root)
+        except ValueError:
+            continue
+        return (
+            "该路径位于受保护的 Skill 目录中，不能使用通用文件工具修改；"
+            "请调用 agent_skill_manage 完成 Skill 创建。"
+        )
+    return None
 
 
 class ReadFileTool(Tool):
@@ -73,8 +86,11 @@ class ReadFileTool(Tool):
 class WriteFileTool(Tool):
     """在 workspace 内创建或覆盖文件。"""
 
-    def __init__(self, workspace: Path) -> None:
+    def __init__(
+        self, workspace: Path, *, protected_roots: Iterable[Path] = ()
+    ) -> None:
         self._workspace = workspace
+        self._protected_roots = tuple(root.resolve() for root in protected_roots)
 
     @property
     def name(self) -> str:
@@ -102,6 +118,9 @@ class WriteFileTool(Tool):
             file_path = _safe_path(self._workspace, path)
         except PermissionError as e:
             return str(e)
+        protected_error = _protected_root_error(file_path, self._protected_roots)
+        if protected_error:
+            return protected_error
         try:
             file_path.parent.mkdir(parents=True, exist_ok=True)
             file_path.write_text(content, encoding="utf-8")
@@ -113,8 +132,11 @@ class WriteFileTool(Tool):
 class EditFileTool(Tool):
     """在 workspace 内的文件中精确替换字符串。"""
 
-    def __init__(self, workspace: Path) -> None:
+    def __init__(
+        self, workspace: Path, *, protected_roots: Iterable[Path] = ()
+    ) -> None:
         self._workspace = workspace
+        self._protected_roots = tuple(root.resolve() for root in protected_roots)
 
     @property
     def name(self) -> str:
@@ -143,6 +165,9 @@ class EditFileTool(Tool):
             file_path = _safe_path(self._workspace, path)
         except PermissionError as e:
             return str(e)
+        protected_error = _protected_root_error(file_path, self._protected_roots)
+        if protected_error:
+            return protected_error
         if not file_path.exists():
             return f"文件不存在：{path}"
         try:

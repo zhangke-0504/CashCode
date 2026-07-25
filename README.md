@@ -76,7 +76,10 @@ CashCode/
 │   ├── .env                       # 环境变量配置
 │   ├── requirements.txt
 │   ├── data/                      # Skill、用户 MCP 与自进化运行数据（不提交 git）
-│   │   └── mcp/servers.json       # 用户创建的 SSE MCP 配置
+│   │   ├── mcp/servers.json       # 用户创建的 SSE MCP 配置
+│   │   └── skills/
+│   │       ├── user/              # 用户上传和管理的 Skill
+│   │       └── agent/             # 聊天/Agent 创建的 Skill
 │   ├── memory/                    # 运行时记忆数据（不提交 git）
 │   │   ├── SOUL.md                # Agent 人格文件（提交 git）
 │   │   ├── MEMORY.md              # 全局长期记忆（运行时生成）
@@ -104,7 +107,8 @@ CashCode/
 │       │       ├── shell.py       # ExecTool
 │       │       └── result.py      # 工具结果的模型/前端/持久化投影
 │       ├── skills/                # Skill 目录、加载、管理和自进化实现
-│       │   └── builtin/           # 只读内置 Skill
+│       │   ├── archive.py         # ZIP 安全校验与解包
+│       │   └── builtin/           # 只读内置 Skill（提交 git）
 │       ├── api/
 │       │   ├── skills.py          # Skill 管理 API
 │       │   ├── mcp.py             # MCP 市场、CRUD 与连接 API
@@ -118,7 +122,7 @@ CashCode/
 │       └── bus/
 │           ├── queue.py           # MessageBus
 │           └── events.py          # InboundMessage, OutboundMessage
-├── mcp_servers/                   # 本地 MCP mock servers
+├── mcp_servers/                   # 内置 MCP 配置与测试服务（白名单提交）
 │   ├── mcp_config.json            # MCP server 配置（stdio/SSE）
 │   ├── test_stdio_mcp/
 │   │   └── server.py              # stdio 测试服务（say_hello）
@@ -469,7 +473,7 @@ python mcp_servers/test_sse_mcp/server.py
 
 ## 五、Skill 体系
 
-CashCode 在服务端提供本地 Skill 运行时。模型始终可见 `skill_search`、`skill_load` 和 `skill_read_resource`，但系统不会把所有已安装 Skill 的描述或正文一次性注入上下文。
+CashCode 在服务端提供本地 Skill 运行时。模型始终可见 `skill_search`、`skill_load`、`skill_read_resource` 和受管的 `agent_skill_manage`，但系统不会把所有已安装 Skill 的描述或正文一次性注入上下文。
 
 ### 存储目录
 
@@ -477,8 +481,8 @@ CashCode 在服务端提供本地 Skill 运行时。模型始终可见 `skill_se
 
 ```text
 skills/user/          用户管理的 Skill 包
-skills/agent/         审批通过后由 Agent 创建的 Skill 包
-skill-snapshots/      replace 和 rollback 使用的版本快照
+skills/agent/         聊天创建或审批通过后由 Agent 持有的 Skill 包
+skill-snapshots/      replace、rollback 和 invalid 删除使用的恢复快照
 skill-evolution/      自进化证据与提案
 ```
 
@@ -486,11 +490,12 @@ skill-evolution/      自进化证据与提案
 
 ### Skill 包格式
 
-每个 Skill 是一个包含 `SKILL.md` 的目录，还可按需包含 `references/`、`templates/`、`scripts/` 和 `assets/`。目录名必须与 frontmatter 的 `name` 一致。
+每个 Skill 是一个包含 `SKILL.md` 的目录，还可按需包含 `references/`、`templates/`、`scripts/` 和 `assets/`。目录名必须与 frontmatter 的 canonical `name` 一致。`name` 只允许 1-64 位小写字母、数字、点、下划线和连字符，用于目录、API 路由、搜索精确身份、`@` 选择、冲突判断、hash 和快照；可选 `display_name` 最多 80 个字符，仅用于市场和聊天选择器中的显示标签。
 
 ```yaml
 ---
 name: example-workflow
+display_name: 示例工作流
 description: 描述该能力以及应该在什么场景使用
 version: 1
 tags: [example]
@@ -508,13 +513,31 @@ optional:
 
 加载器会校验 YAML 字段类型、名称、UTF-8 编码、文件大小、支持目录和路径边界，并拒绝绝对路径、`..` 穿越与逃逸包目录的符号链接。Skill 被加载时不会自动执行脚本、安装二进制、修改环境变量、进行认证或启动未声明的 MCP。
 
+### Skill 市场、上传与编辑
+
+左侧栏的 `Skill 市场` 会分页显示当前有效目录中的内置、用户上传和聊天/Agent 创建 Skill。列表使用 `display_name` 作为主标签，并保留 canonical `name` 作为稳定身份。列表保留已禁用和缺少依赖的项目，便于重新启用或排查；内置项标记为 `内置`，只能查看，不能编辑、禁用或删除。用户和 Agent Skill 可以查看完整 `SKILL.md`、编辑、启用/禁用和确认删除。
+
+上传入口只接受一个 ZIP Skill 包。ZIP 可以在根目录直接包含 `SKILL.md`，也可以使用一个顶层包装目录；最终目录名由经过校验的 frontmatter `name` 决定。服务端限制压缩包为 10 MiB、成员数为 256、解压后总量为 20 MiB，并继续应用 `SKILL.md` 80 KB、单个支持文件 200 KB 的限制。路径穿越、盘符路径、重复路径、加密成员、符号链接和特殊文件会被拒绝。
+
+上传包始终写入 `skills/user/`，归档中的 `_meta.json` 不能声明内置或 Agent 所有权。同名包只要存在于 `builtin`、`user` 或 `agent` 任一目录都会返回 `409`，不会覆盖或遮蔽已有 Skill。解包和完整校验在隐藏临时目录中完成，通过后才原子发布并刷新运行中 catalog。
+
+用户在聊天中明确要求创建 Skill 时，Agent 会先加载内置 `skill-creator`，再调用 `agent_skill_manage(action=create)`。该工具强制写入 `skills/agent/` 并启用包，在创建目录之前使用 catalog 相同的 loader 校验完整内容，再通过共享 `SkillStore` 完成跨根重名检查、原子发布和 catalog 刷新；只有返回 `success=true` 且同名、同 hash、`source=agent` 的记录已经可见时才算成功。校验失败时 Agent 只能修正内容后重试该管理工具或报告失败。通用 `write_file` 和 `edit_file` 会拒绝 user/agent Skill 根，创建流程也不得使用 `exec`、`curl` 或临时 HTTP 请求绕过管理工具。
+
+Python 工具注册和内置 `skill-creator` 合约只在服务启动时加载。更新服务端代码后必须重启 CashCode；旧进程不会自动获得 `agent_skill_manage` 或目录写保护，历史版本可能仍尝试 `write_file/exec`，不能用旧进程验证新的创建链路。
+
+无效目录不会进入搜索、`@` 选择或正常 Skill 列表。市场会在独立诊断区显示经过脱敏和限长的来源、目录名与错误信息；诊断行不能查看内容、编辑、启停或选择。user/agent 来源提供显式删除按钮，确认后服务端会再次校验目标仍然无效，再把整个目录移到 `skill-snapshots/invalid/<source>/...` 并刷新 catalog；内置来源没有删除按钮。系统不会自动迁移、改写或删除 legacy 包。
+
+若 legacy 包（例如 `server/data/skills/user/renzhi-niuqu`）因 frontmatter 使用 `name: 认知扭曲` 而无效，可选择一种显式修复方式：保留目录时先停止服务，将 `name` 改为与目录一致的 `renzhi-niuqu`，再添加 `display_name: 认知扭曲` 并检查包根只含允许的文件，随后重启；放弃旧包时可直接在市场确认删除，目录会保存在 invalid 恢复快照中。只要旧目录仍存在于活动根，上传和聊天创建同名 Skill 都会返回冲突，防止静默覆盖。
+
+市场编辑器第一版只修改完整 `SKILL.md`，不支持重命名，也不逐文件编辑 `references/`、`templates/`、`scripts/` 或 `assets/`。保存请求携带读取时的内容 hash；发生并发修改时返回 `409` 并保留当前草稿。保存会创建版本快照，未提交的支持文件会原样复制，因此二进制资产不会被文本编码改写。
+
 ### 搜索、加载与上下文生命周期
 
 自然语言调用采用两阶段懒加载：
 
 ```text
 用户问题
-  → skill_search(query)        只搜索名称、描述、标签和触发词
+  → skill_search(query)        搜索 canonical/display 名称、描述、标签和触发词
   → skill_load(exact_name)     校验后把完整 SKILL.md 注入当前 Turn
   → skill_read_resource(...)   工作流需要时再读取单个支持文件
   → 业务工具
@@ -537,12 +560,15 @@ Session metadata 中的 `activated_skills` 是有界 LRU 摘要，只包含名�
 |---|---|
 | `GET/POST /api/skills` | 分页查询或创建 Skill |
 | `GET/PUT/DELETE /api/skills/{name}` | 查看、替换或删除 Skill |
+| `POST /api/skills/import` | 安全导入单个用户 Skill ZIP |
+| `GET /api/skills/{name}/content` | 读取完整 `SKILL.md`、hash、来源和可变状态 |
+| `DELETE /api/skills/invalid/{source}/{directory}` | 重新校验并快照删除无效 user/agent 包 |
 | `POST /api/skills/{name}/validate` | 重新校验 Skill 包 |
 | `PATCH /api/skills/{name}/enabled` | 启用或禁用可变 Skill |
 | `GET /api/skills/{name}/versions` | 查询版本快照 |
 | `POST /api/skills/{name}/rollback/{version}` | 原子回滚到指定版本 |
 
-内置 Skill 不允许修改。用户和 Agent Skill 的写操作统一经过名称、内容、路径、hash 前置条件和原子替换校验；替换及回滚前会保留快照。
+内置 Skill 不允许修改。用户和 Agent Skill 的写操作统一经过名称、内容、路径、hash 前置条件和原子替换校验；替换及回滚前会保留快照。默认的用户/Agent Skill 与用户 MCP 配置都位于 `server/data/`，不会进入 Git；`server/app/skills/builtin/` 和 `mcp_servers/` 白名单中的内置测试资源会被追踪。
 
 ### Skill 自进化预览
 
@@ -670,8 +696,9 @@ cd client && npm install && npm run dev
 
 ### 前端功能
 
-- 侧边栏导航（新建对话 / MCP 市场 / 可折叠历史记录）
+- 侧边栏导航（新建对话 / MCP 市场 / Skill 市场 / 可折叠历史记录）
 - MCP 市场（内置标识、用户 SSE 配置、Headers、连接 / 断开 / 编辑 / 删除）
+- Skill 市场（来源/状态、搜索分页、ZIP 上传、完整配置编辑、启停与删除）
 - 聊天框两级 `@` 选择器与 Skill/MCP 引用芯片
 - 流式聊天消息（Markdown 渲染，含代码高亮和表格）
 - 工具调用进度显示（spinner → 结果预览）

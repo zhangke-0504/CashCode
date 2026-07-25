@@ -6,6 +6,7 @@ import { Sidebar } from './components/Sidebar';
 import { ChatView } from './components/ChatView';
 import { useChatContext } from './context/ChatContext';
 import { McpMarket } from './components/McpMarket';
+import { SkillMarket } from './components/SkillMarket';
 import { useState } from 'react';
 import type { AppView } from './types';
 
@@ -36,7 +37,13 @@ function AppLayout() {
               {state.error}
             </div>
           )}
-          {activeView === 'chat' ? <ChatView /> : <McpMarket />}
+          {activeView === 'chat' ? (
+            <ChatView />
+          ) : activeView === 'mcp-market' ? (
+            <McpMarket />
+          ) : (
+            <SkillMarket />
+          )}
         </main>
       </div>
     </div>

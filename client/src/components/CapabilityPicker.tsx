@@ -1,6 +1,7 @@
 import { ArrowLeft, Network, RefreshCw, Sparkles } from 'lucide-react';
 import type { SelectableMcpServer } from '../lib/api';
 import type { PickerLevel } from '../lib/selections';
+import { skillDisplayName } from '../lib/skill-market';
 import type { SkillSummary } from '../types';
 
 interface CapabilityPickerProps {
@@ -130,10 +131,13 @@ export function CapabilityPicker({
                 className={`flex w-full items-start gap-3 rounded-md px-3 py-2.5 text-left ${activeClass(activeIndex === index)}`}
               >
                 <Sparkles className="mt-0.5 h-4 w-4 shrink-0 text-amber-400" />
-                <span className="min-w-0">
-                  <span className="block truncate text-sm font-medium">{skill.name}</span>
+                <span className="min-w-0 flex-1">
+                  <span className="block truncate text-sm font-medium">{skillDisplayName(skill)}</span>
                   <span className="mt-0.5 block line-clamp-2 text-xs text-zinc-500">{skill.description || '暂无描述'}</span>
                 </span>
+                {skillDisplayName(skill) !== skill.name && (
+                  <span className="max-w-28 shrink-0 truncate font-mono text-[11px] text-zinc-600">{skill.name}</span>
+                )}
               </button>
             ))}
 

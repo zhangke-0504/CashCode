@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import hashlib
 import os
 import re
 import shutil
@@ -13,6 +14,13 @@ from .loader import read_skill_package
 from .models import Availability, SkillError, SkillRecord, SkillSource
 
 TOKEN_RE = re.compile(r"[a-z0-9_.-]+|[\u4e00-\u9fff]", re.IGNORECASE)
+WINDOWS_ABSOLUTE_PATH_RE = re.compile(r"(?i)(?:[a-z]:[\\/]|\\\\)[^\s'\"<>]+")
+POSIX_ABSOLUTE_PATH_RE = re.compile(r"(?<![\w.])/(?:[^/\s'\"<>]+/)*[^/\s'\"<>]*")
+CONTROL_CHAR_RE = re.compile(r"[\x00-\x1f\x7f]")
+MAX_INVALID_PACKAGES = 100
+MAX_INVALID_ERRORS = 3
+MAX_INVALID_DIRECTORY_CHARS = 80
+MAX_INVALID_MESSAGE_CHARS = 240
 
 
 def _tokens(text: str) -> list[str]:
@@ -21,6 +29,32 @@ def _tokens(text: str) -> list[str]:
     compact = re.sub(r"\s+", "", lowered)
     tokens.extend(compact[i:i + 2] for i in range(max(0, len(compact) - 1)) if "\u4e00" <= compact[i] <= "\u9fff")
     return tokens
+
+
+def _bounded_text(value: str, limit: int) -> str:
+    cleaned = CONTROL_CHAR_RE.sub(" ", str(value)).strip()
+    if len(cleaned) <= limit:
+        return cleaned
+    return f"{cleaned[:limit - 3]}..."
+
+
+def sanitize_skill_error(
+    message: str,
+    paths: Iterable[Path] = (),
+    *,
+    limit: int = MAX_INVALID_MESSAGE_CHARS,
+) -> str:
+    cleaned = WINDOWS_ABSOLUTE_PATH_RE.sub("<path>", str(message))
+    cleaned = POSIX_ABSOLUTE_PATH_RE.sub("<path>", cleaned)
+    variants: set[str] = set()
+    for path in paths:
+        variants.update((str(path), path.as_posix()))
+        cleaned_path = str(path).replace("\\", "/")
+        variants.add(cleaned_path)
+    for variant in sorted(variants, key=len, reverse=True):
+        if variant:
+            cleaned = cleaned.replace(variant, "<path>")
+    return _bounded_text(cleaned, max(4, limit)) or "invalid Skill package"
 
 
 class SkillCatalog:
@@ -44,6 +78,7 @@ class SkillCatalog:
         self._mcp_servers = mcp_servers or (lambda: ())
         self._records: dict[str, SkillRecord] = {}
         self._invalid: dict[str, list[str]] = {}
+        self._invalid_targets: dict[tuple[SkillSource, str], Path] = {}
         self._revision = 0
         self._lock = threading.RLock()
         self._document_tokens: dict[str, list[str]] = {}
@@ -65,12 +100,17 @@ class SkillCatalog:
 
     @property
     def invalid(self) -> dict[str, list[str]]:
-        return dict(self._invalid)
+        return {key: list(errors) for key, errors in self._invalid.items()}
+
+    def invalid_target(self, source: SkillSource, directory: str) -> Path | None:
+        with self._lock:
+            return self._invalid_targets.get((source, directory))
 
     def refresh(self) -> None:
         with self._lock:
             candidates: dict[str, list[SkillRecord]] = defaultdict(list)
             invalid: dict[str, list[str]] = {}
+            invalid_targets: dict[tuple[SkillSource, str], Path] = {}
             for source in (SkillSource.BUILTIN, SkillSource.USER, SkillSource.AGENT):
                 root = self.roots[source]
                 root.mkdir(parents=True, exist_ok=True)
@@ -90,7 +130,21 @@ class SkillCatalog:
                         self._apply_availability(record)
                         candidates[manifest.name].append(record)
                     except (SkillError, OSError, UnicodeError) as exc:
-                        invalid[f"{source.value}:{child.name}"] = [str(exc)]
+                        if len(invalid) >= MAX_INVALID_PACKAGES:
+                            continue
+                        directory = _bounded_text(child.name, MAX_INVALID_DIRECTORY_CHARS) or "unknown"
+                        key = f"{source.value}:{directory}"
+                        if key in invalid:
+                            suffix = hashlib.sha256(
+                                child.name.encode("utf-8")
+                            ).hexdigest()[:8]
+                            prefix_limit = MAX_INVALID_DIRECTORY_CHARS - len(suffix) - 1
+                            directory = f"{_bounded_text(child.name, prefix_limit)}~{suffix}"
+                            key = f"{source.value}:{directory}"
+                        invalid[key] = [
+                            sanitize_skill_error(str(exc), (root, child))
+                        ][:MAX_INVALID_ERRORS]
+                        invalid_targets[(source, directory)] = child
 
             effective: dict[str, SkillRecord] = {}
             precedence = {SkillSource.BUILTIN: 0, SkillSource.USER: 1, SkillSource.AGENT: 2}
@@ -101,9 +155,11 @@ class SkillCatalog:
                 effective[name] = chosen
             self._records = effective
             self._invalid = invalid
+            self._invalid_targets = invalid_targets
             self._document_tokens = {
                 name: _tokens(" ".join((
                     record.name,
+                    record.display_name,
                     record.manifest.description,
                     " ".join(record.manifest.tags),
                     " ".join(record.manifest.triggers),
@@ -156,14 +212,20 @@ class SkillCatalog:
             rows = [row for row in rows if row.availability.value == availability]
         return sorted(rows, key=lambda row: row.name)
 
-    def search(self, query: str, limit: int = 8) -> list[tuple[float, SkillRecord]]:
+    def search(
+        self, query: str, limit: int = 8, *, include_disabled: bool = False
+    ) -> list[tuple[float, SkillRecord]]:
         terms = _tokens(query)
         if not terms:
             return []
         with self._lock:
             documents = dict(self._document_tokens)
             records = dict(self._records)
-        eligible = {name: tokens for name, tokens in documents.items() if records[name].enabled}
+        eligible = {
+            name: tokens
+            for name, tokens in documents.items()
+            if include_disabled or records[name].enabled
+        }
         if not eligible:
             return []
         doc_frequency = Counter()
@@ -186,7 +248,7 @@ class SkillCatalog:
             if score > 0:
                 scores.append((score, records[name]))
         scores.sort(key=lambda row: (-row[0], row[1].name))
-        return scores[:max(1, min(int(limit), 50))]
+        return scores[:max(1, min(int(limit), 10_000))]
 
     def load_body(self, name: str) -> tuple[SkillRecord, str]:
         record = self.get(name)

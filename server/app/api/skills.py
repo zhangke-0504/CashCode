@@ -2,10 +2,10 @@ from __future__ import annotations
 
 from typing import Any
 
-from fastapi import APIRouter, HTTPException, Query, Request, status
+from fastapi import APIRouter, File, HTTPException, Query, Request, UploadFile, status
 from pydantic import BaseModel, Field
 
-from ..skills.loader import read_skill_package
+from ..skills.loader import MAX_SKILL_ZIP_BYTES, read_skill_package
 from ..skills.models import (
     SkillConflictError,
     SkillError,
@@ -65,7 +65,13 @@ async def list_skills(
 ) -> dict[str, Any]:
     catalog = _store(request).catalog
     if query:
-        records = [record for _, record in catalog.search(query, page * page_size)]
+        catalog_size = max(1, len(catalog.list()))
+        records = [
+            record
+            for _, record in catalog.search(
+                query, catalog_size, include_disabled=True
+            )
+        ]
         if source:
             records = [record for record in records if record.source.value == source]
         if enabled is not None:
@@ -99,6 +105,22 @@ async def create_skill(request: Request, body: SkillCreateRequest) -> dict[str, 
         _raise_skill_error(exc)
 
 
+@router.post("/import", status_code=status.HTTP_201_CREATED)
+async def import_skill(request: Request, file: UploadFile = File(...)) -> dict[str, Any]:
+    """接收并安装单个 ZIP 格式的用户 Skill。"""
+
+    filename = (file.filename or "").strip()
+    if not filename.lower().endswith(".zip"):
+        raise HTTPException(status_code=422, detail="Skill package must be a .zip file")
+    data = await file.read(MAX_SKILL_ZIP_BYTES + 1)
+    if len(data) > MAX_SKILL_ZIP_BYTES:
+        raise HTTPException(status_code=422, detail="Skill ZIP is too large")
+    try:
+        return _store(request).import_zip(data)
+    except Exception as exc:
+        _raise_skill_error(exc)
+
+
 @router.get("/{name}")
 async def get_skill(request: Request, name: str) -> dict[str, Any]:
     record = _store(request).catalog.get(name)
@@ -113,6 +135,16 @@ async def get_skill(request: Request, name: str) -> dict[str, Any]:
         data["validation_errors"] = [str(exc)]
     data["versions"] = _store(request).versions(name)
     return data
+
+
+@router.get("/{name}/content")
+async def get_skill_content(request: Request, name: str) -> dict[str, Any]:
+    """返回编辑器需要的完整 SKILL.md，不暴露宿主机路径。"""
+
+    try:
+        return _store(request).read_content(name)
+    except Exception as exc:
+        _raise_skill_error(exc)
 
 
 @router.post("/{name}/validate")
@@ -152,6 +184,18 @@ async def set_skill_enabled(request: Request, name: str, body: SkillEnabledReque
 async def delete_skill(request: Request, name: str) -> None:
     try:
         _store(request).delete(name)
+    except Exception as exc:
+        _raise_skill_error(exc)
+
+
+@router.delete("/invalid/{source}/{directory}")
+async def delete_invalid_skill(
+    request: Request, source: str, directory: str
+) -> dict[str, str]:
+    """删除用户确认的无效 Skill 包，并保留可恢复快照。"""
+
+    try:
+        return _store(request).delete_invalid(source, directory)
     except Exception as exc:
         _raise_skill_error(exc)
 
