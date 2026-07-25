@@ -18,7 +18,9 @@ from ..memory.consolidator import SimpleConsolidator
 from ..memory.store import MemoryStore
 from ..paths import DataPaths
 from ..skills.activation import ActivatedSkillSet, TurnSkillContext, use_skill_context
+from ..skills.authoring import AgentSkillManageTool
 from ..skills.catalog import SkillCatalog
+from ..skills.store import SkillStore
 from ..skills.tools import (
     SkillLoadTool,
     SkillReadResourceTool,
@@ -64,6 +66,7 @@ class SimpleAgentLoop:
         *,
         data_paths: DataPaths | None = None,
         skill_catalog: SkillCatalog | None = None,
+        skill_store: SkillStore | None = None,
     ) -> None:
         self.bus = bus
         self._sessions: dict[str, list[dict[str, Any]]] = {}
@@ -94,8 +97,20 @@ class SimpleAgentLoop:
             WebFetchTool(),
             WebSearchTool(),
             ReadFileTool(workspace),
-            WriteFileTool(workspace),
-            EditFileTool(workspace),
+            WriteFileTool(
+                workspace,
+                protected_roots=(
+                    self._data_paths.skills_user,
+                    self._data_paths.skills_agent,
+                ),
+            ),
+            EditFileTool(
+                workspace,
+                protected_roots=(
+                    self._data_paths.skills_user,
+                    self._data_paths.skills_agent,
+                ),
+            ),
             ListDirTool(workspace),
             GlobTool(workspace),
             GrepTool(workspace),
@@ -111,11 +126,21 @@ class SimpleAgentLoop:
         self._mcp_locks: dict[str, asyncio.Lock] = {}
 
         builtin_root = Path(__file__).resolve().parents[1] / "skills" / "builtin"
-        self._skill_catalog = skill_catalog or SkillCatalog(
-            builtin_root,
-            self._data_paths.skills_user,
-            self._data_paths.skills_agent,
+        self._skill_catalog = skill_catalog or (
+            skill_store.catalog
+            if skill_store is not None
+            else SkillCatalog(
+                builtin_root,
+                self._data_paths.skills_user,
+                self._data_paths.skills_agent,
+            )
         )
+        if skill_store is not None and skill_store.catalog is not self._skill_catalog:
+            raise ValueError("skill_store and skill_catalog must share the same catalog")
+        self._skill_store = skill_store or SkillStore(
+            self._skill_catalog, self._data_paths.skill_snapshots
+        )
+        self._registry.register(AgentSkillManageTool(self._skill_store))
         self._skill_catalog.set_runtime_sources(
             tool_names=lambda: self._registry.tool_names,
             mcp_servers=lambda: self._mcp_config.keys(),
@@ -142,6 +167,10 @@ class SimpleAgentLoop:
     @property
     def skill_catalog(self) -> SkillCatalog:
         return self._skill_catalog
+
+    @property
+    def skill_store(self) -> SkillStore:
+        return self._skill_store
 
     def set_skill_evolution(self, service: Any) -> None:
         self._skill_evolution = service
@@ -551,7 +580,12 @@ class SimpleAgentLoop:
         system_content += (
             "\n\n## Skill usage\nSearch installed workflows with skill_search, then call "
             "skill_load with an exact result. Skill bodies are current-turn-only and must "
-            "be reloaded in a later turn when full guidance is needed."
+            "be reloaded in a later turn when full guidance is needed. For an explicit "
+            "request to create a Skill, load skill-creator and use agent_skill_manage; "
+            "never create managed Skill files with write_file, edit_file, exec, curl, or "
+            "ad hoc HTTP calls. Claim creation succeeded only when the managed tool returns "
+            "success=true. If managed validation fails, correct the content and retry only "
+            "through agent_skill_manage, or report the failure."
         )
         recent = render_activated_skill_summary(self._skill_catalog, activated_skills)
         if recent:

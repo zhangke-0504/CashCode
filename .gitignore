@@ -70,11 +70,19 @@ node_modules/
 /server/uploads/
 /server/data/
 
+# MCP 内置目录采用白名单：只追踪配置目录和两个测试服务，用户新增目录不提交
+/mcp_servers/*
+!/mcp_servers/mcp_config.json
+!/mcp_servers/test_stdio_mcp/
+!/mcp_servers/test_stdio_mcp/**
+!/mcp_servers/test_sse_mcp/
+!/mcp_servers/test_sse_mcp/**
+
 # MCP 运行时数据
 # mcp_cache：V2 工具 schema 磁盘缓存，运行时自动生成，不提交
 /server/mcp_cache/
 # MCP server 的用户数据目录（如 notes MCP 生成的便签文件）
-mcp_servers/*/data/
+/mcp_servers/*/data/
 
 # ===== 临时脚本 =====
 test_mcp.py

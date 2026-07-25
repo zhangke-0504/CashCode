@@ -19,6 +19,7 @@ import {
   replaceCapabilityTrigger,
   SelectionError,
 } from '../lib/selections';
+import { skillDisplayName, skillSelectionReceipt } from '../lib/skill-market';
 import type {
   CapabilityTrigger,
   PickerLevel,
@@ -132,7 +133,11 @@ export function Composer() {
 
   const query = picker?.trigger.query ?? '';
   const filteredSkills = useMemo(
-    () => filterCapabilities(skills, query, (skill) => [skill.name, skill.description]),
+    () => filterCapabilities(skills, query, (skill) => [
+      skillDisplayName(skill),
+      skill.name,
+      skill.description,
+    ]),
     [skills, query],
   );
   const filteredMcps = useMemo(
@@ -170,7 +175,7 @@ export function Composer() {
 
   const selectSkill = (skill: SkillSummary) => {
     try {
-      setSelections(addSkillSelection(selections, { name: skill.name, label: skill.name }));
+      setSelections(addSkillSelection(selections, skillSelectionReceipt(skill)));
       setSelectionError(null);
       consumeTrigger();
     } catch (error) {

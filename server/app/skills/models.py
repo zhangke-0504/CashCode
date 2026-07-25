@@ -31,6 +31,7 @@ class DependencySet:
 class SkillManifest:
     name: str
     description: str
+    display_name: str | None = None
     version: int = 1
     tags: tuple[str, ...] = ()
     triggers: tuple[str, ...] = ()
@@ -55,9 +56,14 @@ class SkillRecord:
     def name(self) -> str:
         return self.manifest.name
 
+    @property
+    def display_name(self) -> str:
+        return self.manifest.display_name or self.name
+
     def to_dict(self, *, include_path: bool = False) -> dict[str, Any]:
         data = {
             "name": self.name,
+            "display_name": self.display_name,
             "description": self.manifest.description,
             "version": self.manifest.version,
             "tags": list(self.manifest.tags),
@@ -92,4 +98,8 @@ class SkillConflictError(SkillError):
 
 
 class SkillPermissionError(SkillError):
+    pass
+
+
+class SkillPublicationError(SkillError):
     pass

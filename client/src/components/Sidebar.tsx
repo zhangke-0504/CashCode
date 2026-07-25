@@ -9,6 +9,7 @@ import {
   Pencil,
   Plus,
   Trash2,
+  Zap,
 } from 'lucide-react';
 import { useChatContext } from '../context/ChatContext';
 import { renameSession, deleteSession } from '../lib/api';
@@ -132,6 +133,18 @@ export function Sidebar({ activeView, mobileOpen, onCloseMobile, onViewChange }:
         >
           <Network className="w-4 h-4" />
           MCP 市场
+        </button>
+        <button
+          onClick={() => onViewChange('skill-market')}
+          aria-current={activeView === 'skill-market' ? 'page' : undefined}
+          className={`w-full flex items-center gap-2 px-3 py-2 rounded-md text-sm transition-colors ${
+            activeView === 'skill-market'
+              ? 'bg-zinc-800 text-zinc-100'
+              : 'text-zinc-300 hover:bg-zinc-800'
+          }`}
+        >
+          <Zap className="w-4 h-4" />
+          Skill 市场
         </button>
       </div>
 

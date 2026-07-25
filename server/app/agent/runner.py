@@ -115,7 +115,9 @@ class SimpleAgentRunner:
                 had_tool_error = had_tool_error or stripped_result.startswith("Error")
                 if stripped_result.startswith("{"):
                     try:
-                        had_tool_error = had_tool_error or bool(json.loads(stripped_result).get("error"))
+                        payload = json.loads(stripped_result)
+                        had_tool_error = had_tool_error or bool(payload.get("error"))
+                        had_tool_error = had_tool_error or payload.get("success") is False
                     except (json.JSONDecodeError, AttributeError):
                         pass
                 await self._notify_tool_result(
