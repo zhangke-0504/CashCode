@@ -12,6 +12,7 @@
 服务端 → 客户端帧：
   {"event": "ready",      "chat_id": "...", "client_id": "..."}   — 建立连接时
   {"event": "attached",   "chat_id": "..."}                       — new_chat / attach 后
+  {"event": "session_updated", "chat_id": "...", "title": "...", "updated_at": "..."}
   {"event": "delta",      "chat_id": "...", "text": "...",  "stream_id": ...}
   {"event": "stream_end", "chat_id": "...", "stream_id": ...}
   {"event": "done",       "chat_id": "...", "duration_sec": 1.23}
@@ -266,6 +267,15 @@ class WebSocketChannel:
         """将 OutboundMessage 转换为对应的线上协议帧。"""
         meta = msg.metadata or {}
         chat_id = msg.chat_id
+
+        if meta.get("_session_updated"):
+            await self._fan_out(chat_id, {
+                "event": "session_updated",
+                "chat_id": chat_id,
+                "title": str(meta.get("_title", "")),
+                "updated_at": str(meta.get("_updated_at", "")),
+            })
+            return
 
         if meta.get("_user_error"):
             await self._fan_out(chat_id, {

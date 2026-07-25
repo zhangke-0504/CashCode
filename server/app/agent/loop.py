@@ -7,6 +7,7 @@ import json
 import logging
 import os
 import time
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -55,6 +56,12 @@ _DEFAULT_SOUL = """You are CashCode, a capable local-first AI assistant with per
 - When the user explicitly asks you to remember durable information, call save_memory.
 - Do not save temporary queries or casual conversation as long-term memory.
 """
+
+
+def first_session_title(content: str) -> str:
+    """Return the deterministic title for a session's first accepted task."""
+
+    return " ".join(content.split())[:40]
 
 
 class SimpleAgentLoop:
@@ -172,6 +179,25 @@ class SimpleAgentLoop:
     @property
     def llm_runtime(self) -> LLMRuntime:
         return self._llm_runtime
+
+    def rename_session(self, chat_id: str, title: str) -> str:
+        """Persist a user title and synchronize any metadata loaded by the Agent."""
+
+        normalized = title.strip()
+        if not normalized:
+            raise ValueError("title must not be empty")
+        if not (self._store.base_dir / chat_id).is_dir():
+            raise FileNotFoundError(chat_id)
+
+        metadata = self._session_metadata.get(chat_id)
+        if metadata is None:
+            metadata = self._store.read_session_metadata(chat_id)
+            self._session_metadata[chat_id] = metadata
+        metadata["title"] = normalized
+        persisted = self._store.read_session_metadata(chat_id)
+        persisted["title"] = normalized
+        self._store.write_session_metadata(chat_id, persisted)
+        return normalized
 
     def set_skill_evolution(self, service: Any) -> None:
         self._skill_evolution = service
@@ -615,6 +641,19 @@ class SimpleAgentLoop:
             },
         ))
 
+    async def _publish_session_updated(self, chat_id: str, title: str) -> None:
+        updated_at = datetime.now().astimezone().isoformat(timespec="seconds")
+        await self.bus.publish_outbound(OutboundMessage(
+            channel="websocket",
+            chat_id=chat_id,
+            content="",
+            metadata={
+                "_session_updated": True,
+                "_title": title,
+                "_updated_at": updated_at,
+            },
+        ))
+
     async def _stream_text(self, text: str, chat_id: str, stream_id: int) -> None:
         for offset in range(0, len(text), self._STREAM_CHUNK_SIZE):
             await self.bus.publish_outbound(OutboundMessage(
@@ -669,8 +708,11 @@ class SimpleAgentLoop:
         history = self._sessions[chat_id]
         metadata = self._session_metadata[chat_id]
         metadata_before_turn = copy.deepcopy(metadata)
-        if not metadata.get("title"):
-            metadata["title"] = message.content.strip()[:40] or "New conversation"
+        if not metadata.get("title") and not history:
+            title = first_session_title(message.content)
+            metadata["title"] = title
+            self._store.write_session_metadata(chat_id, metadata)
+            await self._publish_session_updated(chat_id, title)
         history.append({"role": "user", "content": message.content})
 
         activated_tools = ActivatedToolSet.from_session(metadata)
@@ -783,6 +825,9 @@ class SimpleAgentLoop:
             ))
             if history and history[-1].get("role") == "user":
                 history.pop()
+            current_title = metadata.get("title")
+            if current_title:
+                metadata_before_turn["title"] = current_title
             self._session_metadata[chat_id] = metadata_before_turn
             return
 

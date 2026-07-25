@@ -45,15 +45,13 @@ htmlcov/
 /server/test-results/
 /server/output/
 /.test-results/
+/client/tests/
 
 # ===== Node.js =====
 node_modules/
 .npm/
 .pnpm-store/
 .yarn/cache/
-
-# ===== 参考学习项目目录 =====
-/spore/
 
 # ===== 个人调试测试目录 =====
 /my_testing/

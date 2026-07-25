@@ -16,6 +16,13 @@ import type {
 } from '../types';
 import { useWebSocket } from '../hooks/useWebSocket';
 import { fetchSessionMessages, fetchSessions } from '../lib/api';
+import {
+  applyAttachedDraft,
+  applyLoadedSessions,
+  applyReadyDraft,
+  removeSession,
+  upsertSessionUpdate,
+} from '../lib/chat-session-state';
 import { setChatGenerating, type GenerationByChat } from '../lib/generation-state';
 import { normalizePersistedMessage, optimisticMessageFromFrame } from '../lib/selections';
 
@@ -56,6 +63,7 @@ type Action =
   | { type: 'MESSAGES_LOADED'; chat_id: string; messages: Message[] }
   | { type: 'WS_READY'; chat_id: string }
   | { type: 'WS_ATTACHED'; chat_id: string }
+  | { type: 'WS_SESSION_UPDATED'; session: Session }
   | { type: 'WS_DELTA'; chat_id: string; text: string }
   | { type: 'WS_STREAM_END'; chat_id: string }
   | { type: 'WS_DONE'; chat_id: string }
@@ -76,8 +84,7 @@ function reducer(state: ChatState, action: Action): ChatState {
     case 'SESSIONS_LOADED':
       return {
         ...state,
-        sessions: action.sessions,
-        activeSessionId: state.activeSessionId ?? action.sessions[0]?.chat_id ?? null,
+        ...applyLoadedSessions(state, action.sessions),
       };
 
     case 'SESSION_ADDED': {
@@ -99,20 +106,13 @@ function reducer(state: ChatState, action: Action): ChatState {
       };
 
     case 'SESSION_DELETED': {
-      const remaining = state.sessions.filter((s) => s.chat_id !== action.chat_id);
-      const nextActive =
-        state.activeSessionId === action.chat_id
-          ? (remaining[0]?.chat_id ?? null)
-          : state.activeSessionId;
+      const sessionState = removeSession(state, action.chat_id);
       const { [action.chat_id]: _removed, ...msgs } = state.messages;
-      const { [action.chat_id]: _loaded, ...loadedSessionIds } = state.loadedSessionIds;
       const generatingByChat = setChatGenerating(state.generatingByChat, action.chat_id, false);
       return {
         ...state,
-        sessions: remaining,
-        activeSessionId: nextActive,
+        ...sessionState,
         messages: msgs,
-        loadedSessionIds,
         generatingByChat,
       };
     }
@@ -128,31 +128,21 @@ function reducer(state: ChatState, action: Action): ChatState {
       };
 
     case 'WS_READY': {
-      // Server assigned a default chat_id on connection
-      const exists = state.sessions.find((s) => s.chat_id === action.chat_id);
-      const newSession: Session = { chat_id: action.chat_id, title: '新对话', updated_at: new Date().toISOString() };
       return {
         ...state,
-        sessions: exists ? state.sessions : [newSession, ...state.sessions],
-        activeSessionId: state.activeSessionId ?? action.chat_id,
-        loadedSessionIds: exists
-          ? state.loadedSessionIds
-          : { ...state.loadedSessionIds, [action.chat_id]: true },
+        ...applyReadyDraft(state, action.chat_id),
       };
     }
 
     case 'WS_ATTACHED': {
-      const exists = state.sessions.find((s) => s.chat_id === action.chat_id);
-      const newSession: Session = { chat_id: action.chat_id, title: '新对话', updated_at: new Date().toISOString() };
       return {
         ...state,
-        sessions: exists ? state.sessions : [newSession, ...state.sessions],
-        activeSessionId: action.chat_id,
-        loadedSessionIds: exists
-          ? state.loadedSessionIds
-          : { ...state.loadedSessionIds, [action.chat_id]: true },
+        ...applyAttachedDraft(state, action.chat_id),
       };
     }
+
+    case 'WS_SESSION_UPDATED':
+      return { ...state, ...upsertSessionUpdate(state, action.session) };
 
     case 'USER_MESSAGE_SENT': {
       const msg = optimisticMessageFromFrame(action.frame, uuid());
@@ -300,6 +290,16 @@ export function ChatProvider({ children }: { children: React.ReactNode }) {
         break;
       case 'attached':
         dispatch({ type: 'WS_ATTACHED', chat_id: f.chat_id });
+        break;
+      case 'session_updated':
+        dispatch({
+          type: 'WS_SESSION_UPDATED',
+          session: {
+            chat_id: f.chat_id,
+            title: f.title,
+            updated_at: f.updated_at,
+          },
+        });
         break;
       case 'delta':
         dispatch({ type: 'WS_DELTA', chat_id: f.chat_id, text: f.text });

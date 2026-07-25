@@ -243,6 +243,7 @@ export type WsConnectionState = 'connecting' | 'connected' | 'disconnected' | 'e
 export type WsFrame =
   | { event: 'ready'; chat_id: string; client_id: string }
   | { event: 'attached'; chat_id: string }
+  | { event: 'session_updated'; chat_id: string; title: string; updated_at: string }
   | { event: 'delta'; chat_id: string; text: string; stream_id: number }
   | { event: 'stream_end'; chat_id: string; stream_id: number }
   | { event: 'done'; chat_id: string; duration_sec: number }
