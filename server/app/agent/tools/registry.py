@@ -8,8 +8,10 @@ cast_params / validate_params 验证体系，保留最小可用接口：
 from __future__ import annotations
 
 import logging
+import time
 from typing import Any
 
+from ...logging_config import log_event, safe_exception_info
 from .base import Tool
 
 logger = logging.getLogger(__name__)
@@ -119,11 +121,45 @@ class ToolRegistry:
         _HINT = "\n\n[Analyze the error above and try a different approach.]"
         tool = self._tools.get(name)
         if tool is None:
+            log_event(
+                logger,
+                logging.WARNING,
+                "tool.execution.rejected",
+                tool=name,
+                reason="not_found",
+            )
             available = ", ".join(self.tool_names) or "(无)"
             return f"Error: Tool '{name}' not found. Available: {available}{_HINT}"
+        started = time.monotonic()
+        log_event(
+            logger,
+            logging.DEBUG,
+            "tool.execution.started",
+            tool=name,
+        )
         try:
             result = await tool.execute(**params)
+            log_event(
+                logger,
+                logging.INFO,
+                "tool.execution.completed",
+                tool=name,
+                duration_ms=round((time.monotonic() - started) * 1000, 2),
+                result_length=self._result_length(result),
+            )
             return result
         except Exception as exc:
-            logger.exception("ToolRegistry: tool '%s' raised", name)
+            logger.error(
+                "event=tool.execution.failed tool=%s duration_ms=%.2f error_type=%s",
+                name,
+                (time.monotonic() - started) * 1000,
+                type(exc).__name__,
+                exc_info=safe_exception_info(exc),
+            )
             return f"Error executing {name}: {exc}{_HINT}"
+
+    @staticmethod
+    def _result_length(result: Any) -> int | None:
+        if isinstance(result, (str, bytes, list, tuple, dict, set)):
+            return len(result)
+        return None

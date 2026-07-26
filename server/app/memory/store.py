@@ -18,6 +18,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from ..logging_config import log_event
 from ..selections import safe_persisted_selections
 
 logger = logging.getLogger(__name__)
@@ -118,9 +119,14 @@ class MemoryStore:
             f.write(json.dumps(assistant_record, ensure_ascii=False) + "\n")
 
         self._write_cursor(chat_id, assistant_cursor)
-        logger.debug(
-            "MemoryStore: appended turn for chat_id=%s (cursors %d-%d)",
-            chat_id, user_cursor, assistant_cursor,
+        log_event(
+            logger,
+            logging.DEBUG,
+            "session.persistence.turn_appended",
+            chat_id=chat_id,
+            first_cursor=user_cursor,
+            last_cursor=assistant_cursor,
+            record_count=2,
         )
 
     def append_summary(
@@ -280,6 +286,15 @@ class MemoryStore:
                 json.dumps(record, ensure_ascii=False) + "\n" for record in records
             )
         self._write_cursor(chat_id, records[-1]["cursor"])
+        log_event(
+            logger,
+            logging.DEBUG,
+            "session.persistence.traced_turn_appended",
+            chat_id=chat_id,
+            first_cursor=first_cursor,
+            last_cursor=records[-1]["cursor"],
+            record_count=len(records),
+        )
 
     # ------------------------------------------------------------------
     # 读取
@@ -626,6 +641,13 @@ class MemoryStore:
                 tmp.unlink(missing_ok=True)
             except OSError:
                 pass
+        log_event(
+            logger,
+            logging.DEBUG,
+            "session.persistence.metadata_written",
+            chat_id=chat_id,
+            field_count=len(data),
+        )
 
     # ------------------------------------------------------------------
     # 内部辅助

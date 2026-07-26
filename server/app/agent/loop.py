@@ -7,12 +7,14 @@ import json
 import logging
 import os
 import time
+import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 from ..bus.events import InboundMessage, OutboundMessage
 from ..llm.models import LLMNotConfiguredError
+from ..logging_config import log_context, log_event, safe_exception_info
 from ..llm.runtime import LLMRuntime
 from ..bus.queue import MessageBus
 from ..memory.consolidator import ConsolidationPlan, SimpleConsolidator
@@ -274,9 +276,31 @@ class SimpleAgentLoop:
     async def connect_mcp_server(self, server_name: str) -> dict[str, Any]:
         """按服务名串行执行幂等连接，避免重复句柄和工具包装器。"""
 
+        started = time.monotonic()
+        log_event(logger, logging.DEBUG, "mcp.management.connect_started", server=server_name)
         lock = self._mcp_locks.setdefault(server_name, asyncio.Lock())
-        async with lock:
-            return await self._connect_mcp_server_unlocked(server_name)
+        try:
+            async with lock:
+                status = await self._connect_mcp_server_unlocked(server_name)
+        except Exception as exc:
+            logger.error(
+                "event=mcp.management.connect_failed server=%s duration_ms=%.2f error_type=%s",
+                server_name,
+                (time.monotonic() - started) * 1000,
+                type(exc).__name__,
+                exc_info=safe_exception_info(exc),
+            )
+            raise
+        log_event(
+            logger,
+            logging.INFO,
+            "mcp.management.connect_completed",
+            server=server_name,
+            duration_ms=round((time.monotonic() - started) * 1000, 2),
+            status=status.get("status"),
+            tool_count=status.get("tool_count"),
+        )
+        return status
 
     async def _connect_mcp_server_unlocked(self, server_name: str) -> dict[str, Any]:
         """在调用方持有服务锁时完成连接、握手、工具发现和状态发布。"""
@@ -364,11 +388,22 @@ class SimpleAgentLoop:
     ) -> dict[str, Any]:
         """按服务名串行断开连接，并按需清除持久化激活引用。"""
 
+        started = time.monotonic()
         lock = self._mcp_locks.setdefault(server_name, asyncio.Lock())
         async with lock:
-            return await self._disconnect_mcp_server_unlocked(
+            status = await self._disconnect_mcp_server_unlocked(
                 server_name, purge_activations=purge_activations
             )
+        log_event(
+            logger,
+            logging.INFO,
+            "mcp.management.disconnect_completed",
+            server=server_name,
+            duration_ms=round((time.monotonic() - started) * 1000, 2),
+            status=status.get("status"),
+            purged_activations=purge_activations,
+        )
+        return status
 
     async def _disconnect_mcp_server_unlocked(
         self, server_name: str, *, purge_activations: bool
@@ -576,11 +611,11 @@ class SimpleAgentLoop:
 
         try:
             plan = self._consolidator.prepare(chat_id, history)
-        except Exception:
+        except Exception as exc:
             logger.warning(
                 "Consolidator: failed to prepare chat_id=%s",
                 chat_id,
-                exc_info=True,
+                exc_info=safe_exception_info(exc),
             )
             return
         if plan is None:
@@ -611,7 +646,7 @@ class SimpleAgentLoop:
                 logger.warning(
                     "Consolidator: background task failed for chat_id=%s",
                     chat_id,
-                    exc_info=(type(error), error, error.__traceback__),
+                    exc_info=safe_exception_info(error),
                 )
 
         task.add_done_callback(finish)
@@ -671,13 +706,25 @@ class SimpleAgentLoop:
 
     async def _handle_turn(self, message: InboundMessage) -> None:
         chat_id = message.chat_id
+        turn_id = uuid.uuid4().hex
         lock = self._turn_locks.setdefault(chat_id, asyncio.Lock())
         self._turn_lock_users[chat_id] = self._turn_lock_users.get(chat_id, 0) + 1
-        try:
-            async with lock:
-                await self._handle_turn_locked(message)
-        finally:
-            self._release_turn_lock(chat_id, lock)
+        with log_context(chat_id=chat_id, turn_id=turn_id):
+            log_event(
+                logger,
+                logging.INFO,
+                "agent.turn.started",
+                channel=message.channel,
+                content_chars=len(message.content),
+            )
+            try:
+                async with lock:
+                    await self._handle_turn_locked(message)
+            except asyncio.CancelledError:
+                log_event(logger, logging.INFO, "agent.turn.cancelled")
+                raise
+            finally:
+                self._release_turn_lock(chat_id, lock)
 
     async def _handle_turn_locked(self, message: InboundMessage) -> None:
         chat_id = message.chat_id
@@ -691,6 +738,13 @@ class SimpleAgentLoop:
             or not isinstance(model, str)
             or not self._llm_runtime.has_provider(provider)
         ):
+            log_event(
+                logger,
+                logging.WARNING,
+                "agent.turn.rejected",
+                provider=provider,
+                reason="llm_not_configured",
+            )
             await self.bus.publish_outbound(OutboundMessage(
                 channel="websocket",
                 chat_id=chat_id,
@@ -816,7 +870,12 @@ class SimpleAgentLoop:
                 if explicit_receipts:
                     trace.durable_messages[0:0] = explicit_receipts
         except Exception as exc:
-            logger.exception("Agent turn failed for chat_id=%s", chat_id)
+            logger.error(
+                "event=agent.turn.failed duration_ms=%.2f error_type=%s",
+                (time.monotonic() - started) * 1000,
+                type(exc).__name__,
+                exc_info=safe_exception_info(exc),
+            )
             await self.bus.publish_outbound(OutboundMessage(
                 channel="websocket",
                 chat_id=chat_id,
@@ -869,12 +928,15 @@ class SimpleAgentLoop:
             content=trace.final_text,
             metadata={"_turn_done": True, "_duration_sec": duration},
         ))
-        logger.info(
-            "Turn done: chat_id=%s duration=%.2fs chars=%d tool_calls=%d",
-            chat_id,
-            duration,
-            len(trace.final_text),
-            len(trace.tools_used),
+        log_event(
+            logger,
+            logging.INFO,
+            "agent.turn.completed",
+            duration_ms=round(duration * 1000, 2),
+            output_chars=len(trace.final_text),
+            tool_calls=len(trace.tools_used),
+            iterations=trace.iterations,
+            success=trace.success,
         )
         self._schedule_consolidation(
             chat_id,

@@ -2,14 +2,17 @@ from __future__ import annotations
 
 import math
 import hashlib
+import logging
 import os
 import re
 import shutil
 import threading
+import time
 from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Callable, Iterable
 
+from ..logging_config import log_event
 from .loader import read_skill_package
 from .models import Availability, SkillError, SkillRecord, SkillSource
 
@@ -21,6 +24,7 @@ MAX_INVALID_PACKAGES = 100
 MAX_INVALID_ERRORS = 3
 MAX_INVALID_DIRECTORY_CHARS = 80
 MAX_INVALID_MESSAGE_CHARS = 240
+logger = logging.getLogger(__name__)
 
 
 def _tokens(text: str) -> list[str]:
@@ -107,6 +111,7 @@ class SkillCatalog:
             return self._invalid_targets.get((source, directory))
 
     def refresh(self) -> None:
+        started = time.monotonic()
         with self._lock:
             candidates: dict[str, list[SkillRecord]] = defaultdict(list)
             invalid: dict[str, list[str]] = {}
@@ -167,6 +172,15 @@ class SkillCatalog:
                 for name, record in effective.items()
             }
             self._revision += 1
+            log_event(
+                logger,
+                logging.INFO,
+                "skill.catalog.refreshed",
+                duration_ms=round((time.monotonic() - started) * 1000, 2),
+                record_count=len(effective),
+                invalid_count=len(invalid),
+                revision=self._revision,
+            )
 
     def _apply_availability(self, record: SkillRecord) -> None:
         if not record.enabled:

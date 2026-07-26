@@ -41,11 +41,11 @@ coverage.xml
 htmlcov/
 
 # ===== 测试与人工验收产物 =====
-/server/tests/
+# /server/tests/
 /server/test-results/
 /server/output/
 /.test-results/
-/client/tests/
+# /client/tests/
 
 # ===== Node.js =====
 node_modules/
@@ -62,7 +62,6 @@ node_modules/
 /server/memory/MEMORY.md
 /server/memory/.dream_cursor
 /server/memory/*/
-/server/logs/
 /server/tmp/
 /server/temp/
 /server/uploads/
@@ -84,9 +83,6 @@ node_modules/
 # MCP server 的用户数据目录（如 notes MCP 生成的便签文件）
 /mcp_servers/*/data/
 
-# ===== 临时脚本 =====
-test_mcp.py
-
 # OpenSpec：dev 分支追踪归档目录（archive/）和主规范（specs/），不追踪未归档的 changes/
 # main 分支的 .gitignore 排除整个 openspec/
 openspec/changes/*
@@ -100,6 +96,15 @@ openspec/changes/*
 # ===== 日志 =====
 *.log
 logs/
+!/server/logs/
+!/server/pytest_logs/
+!/client/logs/
+/server/logs/*
+!/server/logs/README.md
+/server/pytest_logs/*
+!/server/pytest_logs/README.md
+/client/logs/*
+!/client/logs/README.md
 
 # ===== 临时文件 =====
 *.tmp

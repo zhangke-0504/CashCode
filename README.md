@@ -648,7 +648,33 @@ CASHCODE_ALLOWED_ORIGINS=http://127.0.0.1:5173,http://localhost:5173
 # WORKSPACE_DIR=/your/workspace/path
 # CASHCODE_DATA_DIR=/your/runtime/data/path
 # CASHCODE_CONFIG_DIR=/your/private/config/path
+
+# Persistent runtime logging (defaults shown)
+# CASHCODE_LOG_DIR=logs
+CASHCODE_FILE_LOG_LEVEL=DEBUG
+CASHCODE_CONSOLE_LOG_LEVEL=INFO
+CASHCODE_LOG_RETENTION_DAYS=10
 ```
+
+### Runtime Logs and Test Output
+
+The backend appends UTF-8 runtime records to `server/logs/cashcode.log` by default. It rotates on the first record after local midnight and retains the active calendar day plus the previous nine days. A relative `CASHCODE_LOG_DIR` is resolved from `server/`, independent of the process working directory. Startup fails if the runtime log cannot be created; generated runtime files remain ignored by Git.
+
+Use the existing Miniconda `AuWork` environment as the local server verification environment. From the repository root, synchronize it only from the project requirements and persist test output under `server/pytest_logs` when needed:
+
+```powershell
+conda run -n AuWork python -m pip install --upgrade -r server/requirements.txt
+conda run -n AuWork python -m pytest server/tests *>> server/pytest_logs/pytest.log
+```
+
+Frontend development and test process output belongs under `client/logs`. These PowerShell examples append rather than truncate:
+
+```powershell
+npm --prefix client run dev *>> client/logs/vite.log
+npm --prefix client test *>> client/logs/test.log
+```
+
+`server/pytest_logs` and `client/logs` are not application runtime log destinations. Browser console errors remain in developer tools and are not uploaded automatically.
 
 ### Start the Service
 

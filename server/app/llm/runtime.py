@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import ipaddress
 import inspect
+import logging
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import Any, AsyncIterator, Callable, Mapping
@@ -13,6 +14,7 @@ from urllib.parse import urlsplit
 import httpx
 from openai import AsyncOpenAI
 
+from ..logging_config import log_event
 from .models import (
     LLMNotConfiguredError,
     LLMSettings,
@@ -24,6 +26,7 @@ from .models import (
 
 ClientFactory = Callable[[RuntimeProviderConfig], Any]
 LLMSelection = tuple[ProviderName, str]
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
@@ -127,6 +130,14 @@ class LLMRuntime:
         configs = settings.runtime_configs()
         candidates = dict(clients) if clients is not None else self.create_clients(settings)
         if set(candidates) != set(configs):
+            log_event(
+                logger,
+                logging.WARNING,
+                "llm.runtime.install_rejected",
+                configured_providers=len(configs),
+                candidate_providers=len(candidates),
+                reason="provider_mismatch",
+            )
             for client in candidates.values():
                 await self.close_client(client)
             raise ValueError("runtime clients do not match configured providers")
@@ -162,6 +173,14 @@ class LLMRuntime:
             await self.close_client(value)
         if self._closed:
             raise RuntimeError("LLM runtime is closed")
+        log_event(
+            logger,
+            logging.INFO,
+            "llm.runtime.installed",
+            provider_count=len(installed),
+            generations=",".join(str(value) for value in sorted(installed.values())),
+            retired_clients=len(close_after),
+        )
         return installed
 
     @asynccontextmanager
@@ -180,6 +199,15 @@ class LLMRuntime:
                 provider=normalized_provider,
                 generation=generation.generation,
             )
+        log_event(
+            logger,
+            logging.DEBUG,
+            "llm.runtime.lease_acquired",
+            provider=normalized_provider,
+            model=normalized_model,
+            generation=generation.generation,
+            active_leases=generation.leases,
+        )
         try:
             yield snapshot
         finally:
@@ -221,6 +249,12 @@ class LLMRuntime:
                 generation.closed = True
         for generation in generations:
             await self.close_client(generation.client)
+        log_event(
+            logger,
+            logging.INFO,
+            "llm.runtime.closed",
+            client_count=len(generations),
+        )
 
     @staticmethod
     async def close_client(client: Any) -> None:

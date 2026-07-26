@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import shutil
 import threading
@@ -10,10 +11,13 @@ import uuid
 from pathlib import Path
 from typing import Any
 
+from ..logging_config import log_event
 from .archive import extract_skill_zip
 from .catalog import SkillCatalog
 from .loader import META_FILE, SKILL_FILE, parse_skill_text, read_skill_package, safe_child, validate_name, validate_support_path
 from .models import SkillConflictError, SkillError, SkillNotFoundError, SkillPermissionError, SkillPublicationError, SkillSource
+
+logger = logging.getLogger(__name__)
 
 
 class SkillStore:
@@ -118,7 +122,16 @@ class SkillStore:
                 record = self.catalog.get(name)
                 if record is None or record.source is not SkillSource.USER:
                     raise SkillError("imported Skill did not enter the catalog")
-                return record.to_dict()
+                result = record.to_dict()
+                log_event(
+                    logger,
+                    logging.INFO,
+                    "skill.imported",
+                    skill=name,
+                    source=SkillSource.USER.value,
+                    archive_bytes=len(data),
+                )
+                return result
         except Exception:
             if published and target is not None:
                 shutil.rmtree(target, ignore_errors=True)
@@ -189,7 +202,17 @@ class SkillStore:
                     or record.content_hash != expected_hash
                 ):
                     raise SkillPublicationError("created Skill did not enter the catalog")
-                return record.to_dict(include_path=True)
+                result = record.to_dict(include_path=True)
+                log_event(
+                    logger,
+                    logging.INFO,
+                    "skill.created",
+                    skill=name,
+                    source=source.value,
+                    support_file_count=len(support_files or {}),
+                    enabled=enabled,
+                )
+                return result
             except Exception:
                 if published:
                     shutil.rmtree(target, ignore_errors=True)
@@ -260,6 +283,15 @@ class SkillStore:
                 raise SkillError("updated Skill did not enter the catalog")
             result = updated.to_dict(include_path=True)
             result["snapshot"] = version
+            log_event(
+                logger,
+                logging.INFO,
+                "skill.replaced",
+                skill=name,
+                source=source.value,
+                support_file_count=len(support_files or {}),
+                evolution=evolution,
+            )
             return result
 
     def set_enabled(self, name: str, enabled: bool) -> dict[str, Any]:
@@ -275,7 +307,16 @@ class SkillStore:
             meta["updated_at"] = time.time()
             self._write_meta(record.path, meta)
             self.catalog.refresh()
-            return self.catalog.get(name).to_dict(include_path=True)  # type: ignore[union-attr]
+            result = self.catalog.get(name).to_dict(include_path=True)  # type: ignore[union-attr]
+            log_event(
+                logger,
+                logging.INFO,
+                "skill.enabled_changed",
+                skill=name,
+                source=record.source.value,
+                enabled=enabled,
+            )
+            return result
 
     def delete(self, name: str) -> None:
         record = self.catalog.get(validate_name(name))
@@ -287,6 +328,13 @@ class SkillStore:
             self._snapshot(record.source, name, record.path)
             shutil.rmtree(record.path)
             self.catalog.refresh()
+            log_event(
+                logger,
+                logging.INFO,
+                "skill.deleted",
+                skill=name,
+                source=record.source.value,
+            )
 
     def delete_invalid(
         self, source: str | SkillSource, directory: str
@@ -343,11 +391,19 @@ class SkillStore:
                     os.replace(snapshot, target)
                     self.catalog.refresh()
                 raise
-            return {
+            result = {
                 "source": skill_source.value,
                 "directory": selector,
                 "snapshot": f"invalid/{skill_source.value}/{package_id}/{version}",
             }
+            log_event(
+                logger,
+                logging.INFO,
+                "skill.invalid_deleted",
+                source=skill_source.value,
+                directory=selector,
+            )
+            return result
 
     def versions(self, name: str) -> list[str]:
         record = self.catalog.get(validate_name(name))
@@ -380,4 +436,13 @@ class SkillStore:
                     os.replace(backup, record.path)
                 raise
             self.catalog.refresh()
-            return self.catalog.get(name).to_dict(include_path=True)  # type: ignore[union-attr]
+            result = self.catalog.get(name).to_dict(include_path=True)  # type: ignore[union-attr]
+            log_event(
+                logger,
+                logging.INFO,
+                "skill.rolled_back",
+                skill=name,
+                source=record.source.value,
+                version=version,
+            )
+            return result

@@ -1,26 +1,39 @@
 """CashCode Web 服务：FastAPI 服务器与 WebSocket 聊天通道。"""
 import sys
-import io
 import asyncio
 import argparse
-import logging
 import os
 from contextlib import asynccontextmanager
 from pathlib import Path
 
 # 确保标准输出和标准错误使用 UTF-8 编码。
-sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8")
-sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8")
+for _stream in (sys.stdout, sys.stderr):
+    _reconfigure = getattr(_stream, "reconfigure", None)
+    if callable(_reconfigure):
+        try:
+            _reconfigure(encoding="utf-8")
+        except (OSError, ValueError):
+            pass
 
 # 在其他代码读取 os.environ 前加载 .env。
 from dotenv import load_dotenv
 load_dotenv(Path(__file__).parent / ".env")
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-)
+import logging
+
+from app.logging_config import configure_logging, log_event, safe_exception_info
+
+logging_settings = configure_logging()
 logger = logging.getLogger(__name__)
+log_event(
+    logger,
+    logging.INFO,
+    "logging.configured",
+    log_dir=logging_settings.log_dir,
+    file_level=logging.getLevelName(logging_settings.file_level),
+    console_level=logging.getLevelName(logging_settings.console_level),
+    retention_days=logging_settings.retention_days,
+)
 
 from fastapi import FastAPI
 from starlette.middleware.cors import CORSMiddleware
@@ -44,6 +57,7 @@ from app.llm.paths import resolve_llm_settings_path
 from app.llm.runtime import LLMRuntime
 from app.llm.service import LLMSettingsService
 from app.llm.store import LLMSettingsStore
+from app.http_logging import http_request_logging
 
 
 # ---------------------------------------------------------------------------
@@ -76,8 +90,11 @@ async def _dream_loop(dream: SimpleDream) -> None:
             await asyncio.sleep(interval)
             try:
                 await dream.run()
-            except Exception:
-                logger.warning("Dream: unhandled exception in run()", exc_info=True)
+            except Exception as exc:
+                logger.warning(
+                    "Dream: unhandled exception in run()",
+                    exc_info=safe_exception_info(exc),
+                )
     except asyncio.CancelledError:
         pass
     finally:
@@ -169,6 +186,7 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+app.middleware("http")(http_request_logging)
 
 # 路由
 app.get("/api/health")(health)
@@ -184,4 +202,10 @@ if __name__ == "__main__":
     parser.add_argument("--port", type=int, default=8000, help="HTTP server port")
     args = parser.parse_args()
 
-    uvicorn.run(app, host="127.0.0.1", port=args.port)
+    uvicorn.run(
+        app,
+        host="127.0.0.1",
+        port=args.port,
+        log_config=None,
+        access_log=False,
+    )

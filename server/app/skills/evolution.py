@@ -12,6 +12,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
+from ..logging_config import log_event, safe_exception_info
 from ..llm.models import LLMNotConfiguredError
 from ..llm.runtime import LLMRuntime
 from .catalog import SkillCatalog
@@ -97,7 +98,29 @@ class EvolutionService:
         provider: str | None = None,
         model: str | None = None,
     ) -> None:
+        started = time.monotonic()
+        log_event(
+            logger,
+            logging.DEBUG,
+            "skill_evolution.turn.started",
+            tool_count=len(tools_used),
+        )
         if not self.config.enabled or not persisted or len(tools_used) < self.config.min_tool_calls:
+            reason = (
+                "disabled"
+                if not self.config.enabled
+                else "turn_not_persisted"
+                if not persisted
+                else "insufficient_tool_calls"
+            )
+            log_event(
+                logger,
+                logging.DEBUG,
+                "skill_evolution.turn.skipped",
+                reason=reason,
+                tool_count=len(tools_used),
+                duration_ms=round((time.monotonic() - started) * 1000, 2),
+            )
             return
         task = asyncio.create_task(self._consider_turn(
             chat_id=chat_id,
@@ -109,13 +132,40 @@ class EvolutionService:
             model=model,
         ))
         self._tasks.add(task)
-        task.add_done_callback(self._tasks.discard)
+        task.add_done_callback(self._task_done)
+        log_event(
+            logger,
+            logging.INFO,
+            "skill_evolution.turn.scheduled",
+            tool_count=len(tools_used),
+            pending_tasks=len(self._tasks),
+        )
+
+    def _task_done(self, task: asyncio.Task[Any]) -> None:
+        self._tasks.discard(task)
+        if task.cancelled():
+            log_event(logger, logging.INFO, "skill_evolution.turn.cancelled")
+            return
+        error = task.exception()
+        if error is not None:
+            logger.error(
+                "event=skill_evolution.turn.failed error_type=%s",
+                type(error).__name__,
+                exc_info=safe_exception_info(error),
+            )
 
     async def close(self) -> None:
+        task_count = len(self._tasks)
         for task in list(self._tasks):
             task.cancel()
         if self._tasks:
             await asyncio.gather(*self._tasks, return_exceptions=True)
+        log_event(
+            logger,
+            logging.INFO,
+            "skill_evolution.closed",
+            cancelled_tasks=task_count,
+        )
 
     @staticmethod
     def _sanitize(text: str, limit: int) -> str:
@@ -145,6 +195,13 @@ class EvolutionService:
         provider: str | None,
         model: str | None,
     ) -> None:
+        started = time.monotonic()
+        log_event(
+            logger,
+            logging.DEBUG,
+            "skill_evolution.turn.processing",
+            tool_count=len(tools_used),
+        )
         async with self._gate:
             fingerprint = self._fingerprint(user_content, tools_used)
             evidence_id = f"{int(time.time() * 1000)}-{uuid.uuid4().hex[:8]}"
@@ -172,10 +229,36 @@ class EvolutionService:
                     continue
                 if row.get("fingerprint") == fingerprint:
                     matches.append(row)
-            if len(matches) < self.config.recurrence or self._has_open_fingerprint(fingerprint):
+            if len(matches) < self.config.recurrence:
+                log_event(
+                    logger,
+                    logging.DEBUG,
+                    "skill_evolution.turn.skipped",
+                    reason="recurrence_not_met",
+                    evidence_count=len(matches),
+                    duration_ms=round((time.monotonic() - started) * 1000, 2),
+                )
                 return
-            await self._generate_proposal(
+            if self._has_open_fingerprint(fingerprint):
+                log_event(
+                    logger,
+                    logging.DEBUG,
+                    "skill_evolution.turn.skipped",
+                    reason="proposal_already_open",
+                    evidence_count=len(matches),
+                    duration_ms=round((time.monotonic() - started) * 1000, 2),
+                )
+                return
+            proposal_created = await self._generate_proposal(
                 matches[-self.config.recurrence:], fingerprint, provider, model
+            )
+            log_event(
+                logger,
+                logging.INFO,
+                "skill_evolution.turn.completed",
+                proposal_created=proposal_created,
+                evidence_count=len(matches),
+                duration_ms=round((time.monotonic() - started) * 1000, 2),
             )
 
     def _prune_evidence(self) -> None:
@@ -203,7 +286,7 @@ class EvolutionService:
         fingerprint: str,
         provider: str | None,
         model: str | None,
-    ) -> None:
+    ) -> bool:
         summaries = [record.to_dict() for record in self.catalog.list()[:80]]
         creator = self.catalog.get("skill-creator")
         contract = ""
@@ -237,16 +320,32 @@ class EvolutionService:
                     stream=False,
                 )
         except LLMNotConfiguredError:
-            logger.debug("Evolution: LLM is not configured, skipping proposal")
-            return
+            log_event(
+                logger,
+                logging.DEBUG,
+                "skill_evolution.proposal.skipped",
+                reason="llm_not_configured",
+            )
+            return False
         raw = response.choices[0].message.content or ""
         try:
             data = json.loads(raw)
         except json.JSONDecodeError:
-            logger.warning("Evolution proposal was not valid JSON")
-            return
+            log_event(
+                logger,
+                logging.WARNING,
+                "skill_evolution.proposal.rejected",
+                reason="invalid_json",
+            )
+            return False
         if not isinstance(data, dict) or data.get("action") not in {"create", "update"}:
-            return
+            log_event(
+                logger,
+                logging.WARNING,
+                "skill_evolution.proposal.rejected",
+                reason="invalid_action",
+            )
+            return False
         name = str(data.get("name") or "")
         candidate = str(data.get("candidate_content") or "")
         validation: dict[str, Any]
@@ -257,7 +356,13 @@ class EvolutionService:
             validation = {"valid": False, "errors": [str(exc)]}
         target = self.catalog.get(name)
         if data["action"] == "update" and (target is None or target.source is not SkillSource.AGENT):
-            return
+            log_event(
+                logger,
+                logging.WARNING,
+                "skill_evolution.proposal.rejected",
+                reason="invalid_update_target",
+            )
+            return False
         proposal = EvolutionProposal(
             id=uuid.uuid4().hex,
             action=data["action"],
@@ -271,6 +376,16 @@ class EvolutionService:
         payload = asdict(proposal)
         payload["fingerprint"] = fingerprint
         self._write_json(self.proposal_root / f"{proposal.id}.json", payload)
+        log_event(
+            logger,
+            logging.INFO,
+            "skill_evolution.proposal.created",
+            action=proposal.action,
+            skill=proposal.name,
+            candidate_chars=len(candidate),
+            valid=validation["valid"],
+        )
+        return True
 
     def list_proposals(self) -> list[dict[str, Any]]:
         rows = []
@@ -300,6 +415,7 @@ class EvolutionService:
         proposal["status"] = "rejected"
         proposal["updated_at"] = time.time()
         self._write_json(self.proposal_root / f"{proposal_id}.json", proposal)
+        log_event(logger, logging.INFO, "skill_evolution.proposal.rejected_by_user")
         return proposal
 
     def approve(self, proposal_id: str) -> dict[str, Any]:
@@ -325,4 +441,11 @@ class EvolutionService:
         proposal["updated_at"] = time.time()
         proposal["applied_version"] = str(result.get("version") or result.get("snapshot") or "")
         self._write_json(self.proposal_root / f"{proposal_id}.json", proposal)
+        log_event(
+            logger,
+            logging.INFO,
+            "skill_evolution.proposal.approved",
+            action=proposal["action"],
+            skill=proposal["name"],
+        )
         return proposal

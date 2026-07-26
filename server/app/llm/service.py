@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from typing import Any, Mapping
 
+from ..logging_config import log_event
 from .models import (
     LLMSettings,
     LLMSettingsError,
@@ -45,6 +47,7 @@ class LLMSettingsService:
         self._lock = asyncio.Lock()
 
     async def initialize(self, environ: Mapping[str, str] | None = None) -> None:
+        started = time.monotonic()
         async with self._lock:
             try:
                 settings, migrated = self.store.load_or_migrate(environ)
@@ -53,14 +56,37 @@ class LLMSettingsService:
                 self._load_error = exc
                 self._current = None
                 logger.error("LLM settings could not be loaded: %s", exc)
+                log_event(
+                    logger,
+                    logging.ERROR,
+                    "llm.settings.initialize_failed",
+                    duration_ms=round((time.monotonic() - started) * 1000, 2),
+                    error_type=type(exc).__name__,
+                )
                 return
             if settings is None:
                 self._current = None
+                log_event(
+                    logger,
+                    logging.INFO,
+                    "llm.settings.initialized",
+                    configured=False,
+                    duration_ms=round((time.monotonic() - started) * 1000, 2),
+                )
                 return
             await self.runtime.install(settings)
             self._current = settings
             if migrated:
                 logger.info("Migrated legacy DeepSeek credentials to the local settings store")
+            log_event(
+                logger,
+                logging.INFO,
+                "llm.settings.initialized",
+                configured=True,
+                migrated=migrated,
+                provider_count=len(settings.runtime_configs()),
+                duration_ms=round((time.monotonic() - started) * 1000, 2),
+            )
 
     def get_public(self) -> dict[str, Any]:
         if self._load_error is not None:
@@ -73,6 +99,7 @@ class LLMSettingsService:
         return not origin or origin in self.allowed_origins
 
     async def update(self, payload: Mapping[str, Any]) -> dict[str, Any]:
+        started = time.monotonic()
         async with self._lock:
             settings = self._build_candidate(payload)
             settings.validate_persistable()
@@ -86,9 +113,17 @@ class LLMSettingsService:
             await self.runtime.install(settings, clients=candidates)
             self._current = settings
             self._load_error = None
+            log_event(
+                logger,
+                logging.INFO,
+                "llm.settings.updated",
+                provider_count=len(settings.runtime_configs()),
+                duration_ms=round((time.monotonic() - started) * 1000, 2),
+            )
             return settings.to_public()
 
     async def test_connection(self, payload: Mapping[str, Any]) -> dict[str, Any]:
+        started = time.monotonic()
         provider = normalize_provider(payload.get("provider"))
         settings = self._build_candidate(payload)
         config = settings.runtime_config(provider)
@@ -96,10 +131,25 @@ class LLMSettingsService:
         try:
             models = await self._list_models(candidate)
         except Exception as exc:
-            logger.warning("LLM connection test failed (%s)", type(exc).__name__)
+            log_event(
+                logger,
+                logging.WARNING,
+                "llm.connection_test.failed",
+                provider=provider,
+                duration_ms=round((time.monotonic() - started) * 1000, 2),
+                error_type=type(exc).__name__,
+            )
             raise LLMConnectionTestError(self._connection_error_message(exc)) from exc
         finally:
             await self.runtime.close_client(candidate)
+        log_event(
+            logger,
+            logging.INFO,
+            "llm.connection_test.completed",
+            provider=provider,
+            duration_ms=round((time.monotonic() - started) * 1000, 2),
+            model_count=len(models),
+        )
         return {
             "success": True,
             "provider": provider,
@@ -108,6 +158,7 @@ class LLMSettingsService:
         }
 
     async def discover_models(self) -> dict[str, Any]:
+        started = time.monotonic()
         if self._load_error is not None:
             self.get_public()
         settings = self._current
@@ -137,6 +188,15 @@ class LLMSettingsService:
         for provider, ids, error in results:
             providers[provider]["error"] = error
             models.extend({"provider": provider, "id": model_id} for model_id in ids)
+        log_event(
+            logger,
+            logging.INFO,
+            "llm.models.discovered",
+            duration_ms=round((time.monotonic() - started) * 1000, 2),
+            provider_count=len(configs),
+            model_count=len(models),
+            failed_providers=sum(1 for value in providers.values() if value["error"]),
+        )
         return {"models": models, "providers": providers}
 
     async def _list_models(self, client: Any) -> list[str]:
