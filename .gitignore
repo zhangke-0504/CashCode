@@ -41,19 +41,17 @@ coverage.xml
 htmlcov/
 
 # ===== 测试与人工验收产物 =====
-/server/tests/
+# /server/tests/
 /server/test-results/
 /server/output/
 /.test-results/
+# /client/tests/
 
 # ===== Node.js =====
 node_modules/
 .npm/
 .pnpm-store/
 .yarn/cache/
-
-# ===== 参考学习项目目录 =====
-/spore/
 
 # ===== 个人调试测试目录 =====
 /my_testing/
@@ -64,23 +62,28 @@ node_modules/
 /server/memory/MEMORY.md
 /server/memory/.dream_cursor
 /server/memory/*/
-/server/logs/
 /server/tmp/
 /server/temp/
 /server/uploads/
 /server/data/
+# Explicit secret fallback in case the broader runtime-data rule is narrowed later.
+/server/data/settings/llm.json
+
+# MCP 内置目录采用白名单：只追踪配置目录和两个测试服务，用户新增目录不提交
+/mcp_servers/*
+!/mcp_servers/mcp_config.json
+!/mcp_servers/test_stdio_mcp/
+!/mcp_servers/test_stdio_mcp/**
+!/mcp_servers/test_sse_mcp/
+!/mcp_servers/test_sse_mcp/**
 
 # MCP 运行时数据
 # mcp_cache：V2 工具 schema 磁盘缓存，运行时自动生成，不提交
 /server/mcp_cache/
 # MCP server 的用户数据目录（如 notes MCP 生成的便签文件）
-mcp_servers/*/data/
-
-# ===== 临时脚本 =====
-test_mcp.py
+/mcp_servers/*/data/
 
 # OpenSpec：dev 分支追踪归档目录（archive/）和主规范（specs/），不追踪未归档的 changes/
-# main 分支的 .gitignore 排除整个 openspec/
 openspec/changes/*
 !openspec/changes/archive/
 
@@ -92,6 +95,15 @@ openspec/changes/*
 # ===== 日志 =====
 *.log
 logs/
+!/server/logs/
+!/server/pytest_logs/
+!/client/logs/
+/server/logs/*
+!/server/logs/README.md
+/server/pytest_logs/*
+!/server/pytest_logs/README.md
+/client/logs/*
+!/client/logs/README.md
 
 # ===== 临时文件 =====
 *.tmp

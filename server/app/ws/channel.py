@@ -33,6 +33,7 @@ from websockets.asyncio.server import ServerConnection, serve
 from websockets.exceptions import ConnectionClosed
 
 from ..bus.events import InboundMessage, OutboundMessage
+from ..logging_config import log_context, log_event, safe_exception_info
 from ..bus.queue import MessageBus
 from ..selections import SelectionValidationError, sanitize_selection_metadata
 
@@ -131,33 +132,64 @@ class WebSocketChannel:
         client_id = f"client-{uuid.uuid4().hex[:12]}"
         default_chat_id = str(uuid.uuid4())
 
-        self._attach(conn, default_chat_id)
-        await self._send(conn, {
-            "event": "ready",
-            "chat_id": default_chat_id,
-            "client_id": client_id,
-        })
-        logger.info("ws: client connected client_id=%s chat_id=%s", client_id, default_chat_id)
+        with log_context(chat_id=default_chat_id):
+            self._attach(conn, default_chat_id)
+            await self._send(conn, {
+                "event": "ready",
+                "chat_id": default_chat_id,
+                "client_id": client_id,
+            })
+            log_event(
+                logger,
+                logging.INFO,
+                "ws.client.connected",
+                client_id=client_id,
+            )
 
-        try:
-            async for raw in conn:
-                if isinstance(raw, bytes):
-                    try:
-                        raw = raw.decode("utf-8")
-                    except UnicodeDecodeError:
-                        continue
-                await self._ingest_frame(conn, client_id, raw)
-        except ConnectionClosed:
-            pass
-        except Exception as exc:
-            logger.debug("ws: connection ended with error: %s", exc)
-        finally:
-            self._cleanup_conn(conn)
-            logger.info("ws: client disconnected client_id=%s", client_id)
+            try:
+                async for raw in conn:
+                    if isinstance(raw, bytes):
+                        try:
+                            raw = raw.decode("utf-8")
+                        except UnicodeDecodeError:
+                            log_event(
+                                logger,
+                                logging.WARNING,
+                                "ws.frame.rejected",
+                                client_id=client_id,
+                                reason="invalid_utf8",
+                            )
+                            continue
+                    await self._ingest_frame(conn, client_id, raw)
+            except ConnectionClosed:
+                pass
+            except Exception as exc:
+                logger.debug(
+                    "event=ws.connection.failed client_id=%s error_type=%s",
+                    client_id,
+                    type(exc).__name__,
+                    exc_info=safe_exception_info(exc),
+                )
+            finally:
+                self._cleanup_conn(conn)
+                log_event(
+                    logger,
+                    logging.INFO,
+                    "ws.client.disconnected",
+                    client_id=client_id,
+                )
 
     async def _ingest_frame(self, conn: Any, client_id: str, raw: str) -> None:
         envelope = _parse_envelope(raw)
         if envelope is None:
+            log_event(
+                logger,
+                logging.WARNING,
+                "ws.frame.rejected",
+                client_id=client_id,
+                frame_chars=len(raw),
+                reason="invalid_envelope",
+            )
             await self._send(conn, {"event": "error", "detail": "typed JSON envelope required"})
             return
         await self._dispatch_envelope(conn, client_id, envelope)
@@ -177,41 +209,95 @@ class WebSocketChannel:
 
         if t == "new_chat":
             new_id = str(uuid.uuid4())
-            self._attach(conn, new_id)
-            await self._send(conn, {"event": "attached", "chat_id": new_id})
+            with log_context(chat_id=new_id):
+                self._attach(conn, new_id)
+                await self._send(conn, {"event": "attached", "chat_id": new_id})
+                log_event(
+                    logger,
+                    logging.INFO,
+                    "ws.chat.created",
+                    client_id=client_id,
+                )
             return
 
         if t == "attach":
             cid = envelope.get("chat_id")
             if not _is_valid_chat_id(cid):
+                log_event(
+                    logger,
+                    logging.WARNING,
+                    "ws.frame.rejected",
+                    client_id=client_id,
+                    frame_type="attach",
+                    reason="invalid_chat_id",
+                )
                 await self._send(conn, {"event": "error", "detail": "invalid chat_id"})
                 return
-            self._attach(conn, cid)
-            await self._send(conn, {"event": "attached", "chat_id": cid})
+            with log_context(chat_id=str(cid)):
+                self._attach(conn, cid)
+                await self._send(conn, {"event": "attached", "chat_id": cid})
+                log_event(
+                    logger,
+                    logging.INFO,
+                    "ws.chat.attached",
+                    client_id=client_id,
+                )
             return
 
         if t in ("cancel", "stop"):
             cid = envelope.get("chat_id")
             if not _is_valid_chat_id(cid):
+                log_event(
+                    logger,
+                    logging.WARNING,
+                    "ws.frame.rejected",
+                    client_id=client_id,
+                    frame_type=str(t),
+                    reason="invalid_chat_id",
+                )
                 await self._send(conn, {"event": "error", "detail": "invalid chat_id"})
                 return
             # 发布停止信号，使 Agent 可以取消仍在执行的对话轮次。
-            await self.bus.publish_inbound(InboundMessage(
-                channel="websocket",
-                sender_id=client_id,
-                chat_id=str(cid),
-                content="/stop",
-            ))
-            await self._send(conn, {"event": "stop_ack", "chat_id": cid})
+            with log_context(chat_id=str(cid)):
+                await self.bus.publish_inbound(InboundMessage(
+                    channel="websocket",
+                    sender_id=client_id,
+                    chat_id=str(cid),
+                    content="/stop",
+                ))
+                await self._send(conn, {"event": "stop_ack", "chat_id": cid})
+                log_event(
+                    logger,
+                    logging.INFO,
+                    "ws.stop.accepted",
+                    client_id=client_id,
+                )
             return
 
         if t == "message":
             cid = envelope.get("chat_id")
             content = envelope.get("content")
             if not _is_valid_chat_id(cid):
+                log_event(
+                    logger,
+                    logging.WARNING,
+                    "ws.frame.rejected",
+                    client_id=client_id,
+                    frame_type="message",
+                    reason="invalid_chat_id",
+                )
                 await self._send(conn, {"event": "error", "detail": "invalid chat_id"})
                 return
             if not isinstance(content, str) or not content.strip():
+                with log_context(chat_id=str(cid)):
+                    log_event(
+                        logger,
+                        logging.WARNING,
+                        "ws.frame.rejected",
+                        client_id=client_id,
+                        frame_type="message",
+                        reason="missing_content",
+                    )
                 await self._send(conn, {
                     "event": "error",
                     "detail": "missing content",
@@ -224,6 +310,16 @@ class WebSocketChannel:
                     envelope.get("metadata"), require_llm=True
                 )
             except SelectionValidationError as exc:
+                with log_context(chat_id=str(cid)):
+                    log_event(
+                        logger,
+                        logging.WARNING,
+                        "ws.frame.rejected",
+                        client_id=client_id,
+                        error_type=type(exc).__name__,
+                        frame_type="message",
+                        reason="invalid_selection_metadata",
+                    )
                 await self._send(conn, {
                     "event": "error",
                     "detail": str(exc),
@@ -231,16 +327,34 @@ class WebSocketChannel:
                 })
                 return
             # 自动订阅，使客户端可以省略单独的附加会话帧。
-            self._attach(conn, cid)
-            await self.bus.publish_inbound(InboundMessage(
-                channel="websocket",
-                sender_id=client_id,
-                chat_id=str(cid),
-                content=content,
-                metadata=metadata,
-            ))
+            with log_context(chat_id=str(cid)):
+                self._attach(conn, cid)
+                await self.bus.publish_inbound(InboundMessage(
+                    channel="websocket",
+                    sender_id=client_id,
+                    chat_id=str(cid),
+                    content=content,
+                    metadata=metadata,
+                ))
+                log_event(
+                    logger,
+                    logging.INFO,
+                    "ws.message.accepted",
+                    client_id=client_id,
+                    content_chars=len(content),
+                    selected_mcp=len(metadata.get("selected_mcp_connectors", [])),
+                    selected_skills=len(metadata.get("mentioned_skills", [])),
+                )
             return
 
+        log_event(
+            logger,
+            logging.WARNING,
+            "ws.frame.rejected",
+            client_id=client_id,
+            frame_type=str(t),
+            reason="unknown_type",
+        )
         await self._send(conn, {"event": "error", "detail": f"unknown type: {t!r}"})
 
     # ------------------------------------------------------------------

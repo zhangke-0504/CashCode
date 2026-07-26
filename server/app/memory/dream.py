@@ -17,11 +17,13 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from typing import Any
 
 from ..llm.errors import is_expected_provider_failure
 from ..llm.models import LLMNotConfiguredError
 from ..llm.runtime import LLMRuntime, LLMSnapshot
+from ..logging_config import log_event, safe_exception_info
 from .store import MemoryStore
 
 logger = logging.getLogger(__name__)
@@ -55,7 +57,9 @@ class SimpleDream:
         if is_expected_provider_failure(exc):
             logger.warning("Dream: %s provider request failed (%s)", phase, type(exc).__name__)
         else:
-            logger.warning("Dream: %s failed", phase, exc_info=True)
+            logger.warning(
+                "Dream: %s failed", phase, exc_info=safe_exception_info(exc)
+            )
 
     # ------------------------------------------------------------------
     # 数据收集
@@ -183,20 +187,42 @@ class SimpleDream:
           5. 写入 MEMORY.md，更新 dream cursor
         任一步骤异常均记录 warning 并返回 False，不传播异常。
         """
+        started = time.monotonic()
+        log_event(logger, logging.DEBUG, "dream.run.started")
         try:
             batch, updated_cursors = self._collect_new_entries()
-        except Exception:
-            logger.warning("Dream: failed to collect entries", exc_info=True)
+        except Exception as exc:
+            logger.warning(
+                "Dream: failed to collect entries",
+                exc_info=safe_exception_info(exc),
+            )
+            log_event(
+                logger,
+                logging.WARNING,
+                "dream.run.failed",
+                phase="collect",
+                duration_ms=round((time.monotonic() - started) * 1000, 2),
+                error_type=type(exc).__name__,
+            )
             return False
 
         if not batch:
-            logger.debug("Dream: no new entries, skipping")
+            log_event(
+                logger,
+                logging.DEBUG,
+                "dream.run.skipped",
+                reason="no_new_entries",
+                duration_ms=round((time.monotonic() - started) * 1000, 2),
+            )
             return False
 
-        logger.info(
-            "Dream: processing %d entries from %d chat(s)",
-            len(batch),
-            len({e.get("_chat_id") for e in batch}),
+        chat_count = len({entry.get("_chat_id") for entry in batch})
+        log_event(
+            logger,
+            logging.INFO,
+            "dream.run.processing",
+            entry_count=len(batch),
+            chat_count=chat_count,
         )
 
         entries_text = self._format_entries(batch)
@@ -214,6 +240,14 @@ class SimpleDream:
                     raise
                 except Exception as exc:
                     self._log_phase_failure("Phase 1", exc)
+                    log_event(
+                        logger,
+                        logging.WARNING,
+                        "dream.run.failed",
+                        phase="analyze",
+                        duration_ms=round((time.monotonic() - started) * 1000, 2),
+                        error_type=type(exc).__name__,
+                    )
                     return False
 
                 try:
@@ -226,6 +260,14 @@ class SimpleDream:
                     raise
                 except Exception as exc:
                     self._log_phase_failure("Phase 2", exc)
+                    log_event(
+                        logger,
+                        logging.WARNING,
+                        "dream.run.failed",
+                        phase="update",
+                        duration_ms=round((time.monotonic() - started) * 1000, 2),
+                        error_type=type(exc).__name__,
+                    )
                     return False
 
                 if new_memory.strip():
@@ -236,14 +278,52 @@ class SimpleDream:
 
                 try:
                     self._store.set_dream_cursors(updated_cursors)
-                except Exception:
-                    logger.warning("Dream: failed to update dream cursors", exc_info=True)
+                except Exception as exc:
+                    logger.warning(
+                        "Dream: failed to update dream cursors",
+                        exc_info=safe_exception_info(exc),
+                    )
+                    log_event(
+                        logger,
+                        logging.WARNING,
+                        "dream.cursor_update.failed",
+                        error_type=type(exc).__name__,
+                    )
+                log_event(
+                    logger,
+                    logging.INFO,
+                    "dream.run.completed",
+                    entry_count=len(batch),
+                    chat_count=chat_count,
+                    memory_changed=bool(new_memory.strip()),
+                    duration_ms=round((time.monotonic() - started) * 1000, 2),
+                )
                 return True
         except LLMNotConfiguredError:
-            logger.debug("Dream: LLM is not configured, skipping")
+            log_event(
+                logger,
+                logging.DEBUG,
+                "dream.run.skipped",
+                reason="llm_not_configured",
+                duration_ms=round((time.monotonic() - started) * 1000, 2),
+            )
             return False
         except asyncio.CancelledError:
+            log_event(
+                logger,
+                logging.INFO,
+                "dream.run.cancelled",
+                duration_ms=round((time.monotonic() - started) * 1000, 2),
+            )
             raise
         except Exception as exc:
             self._log_phase_failure("runtime acquisition", exc)
+            log_event(
+                logger,
+                logging.WARNING,
+                "dream.run.failed",
+                phase="runtime_acquisition",
+                duration_ms=round((time.monotonic() - started) * 1000, 2),
+                error_type=type(exc).__name__,
+            )
             return False

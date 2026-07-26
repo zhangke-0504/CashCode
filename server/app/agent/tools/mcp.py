@@ -15,10 +15,12 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from contextlib import AsyncExitStack
 from dataclasses import dataclass, field
 from typing import Any
 
+from ...logging_config import log_event, redact_sensitive_text
 from .base import Tool
 
 logger = logging.getLogger(__name__)
@@ -30,6 +32,30 @@ _MCP_TOOL_TIMEOUT    = 30.0   # 单次工具调用超时（秒）
 # ---------------------------------------------------------------------------
 # MCPConnectionHandle：持有单个 MCP 服务的连接生命周期
 # ---------------------------------------------------------------------------
+
+class _MCPStderrSink:
+    """Bridge child stderr signals to metadata-only application events."""
+
+    encoding = "utf-8"
+
+    def __init__(self, server_name: str) -> None:
+        self._server_name = server_name
+
+    def write(self, value: str) -> int:
+        if value.strip():
+            log_event(
+                logger,
+                logging.WARNING,
+                "mcp.stdio.stderr",
+                server=self._server_name,
+                chars=len(value),
+                lines=value.count("\n") or 1,
+            )
+        return len(value)
+
+    def flush(self) -> None:
+        return None
+
 
 @dataclass
 class MCPConnectionHandle:
@@ -104,6 +130,7 @@ async def establish_mcp_sessions(
         holder: dict,
     ) -> None:
         """所有者任务：负责连接、通知就绪、等待关闭并清理资源。"""
+        started = time.monotonic()
         stack = AsyncExitStack()
         await stack.__aenter__()
         try:
@@ -124,7 +151,9 @@ async def establish_mcp_sessions(
                 args    = cfg.get("args", [])
                 env     = cfg.get("env") or None
                 params  = StdioServerParameters(command=command, args=args, env=env)
-                read, write = await stack.enter_async_context(stdio_client(params))
+                read, write = await stack.enter_async_context(
+                    stdio_client(params, errlog=_MCPStderrSink(name))
+                )
 
             elif transport_type == "sse":
                 from mcp.client.sse import sse_client
@@ -143,11 +172,24 @@ async def establish_mcp_sessions(
 
             holder["session"] = session
             ready.set_result(True)
-            logger.info("MCP '%s': connected", name)
+            log_event(
+                logger,
+                logging.INFO,
+                "mcp.connection.connected",
+                server=name,
+                transport=transport_type,
+                duration_ms=round((time.monotonic() - started) * 1000, 2),
+            )
 
             # 挂起，等待关闭信号
             await close_requested.wait()
-            logger.info("MCP '%s': closing", name)
+            log_event(
+                logger,
+                logging.INFO,
+                "mcp.connection.closing",
+                server=name,
+                lifetime_ms=round((time.monotonic() - started) * 1000, 2),
+            )
             await stack.aclose()
 
         except asyncio.CancelledError:
@@ -161,7 +203,15 @@ async def establish_mcp_sessions(
             holder["error"] = safe_error
             if errors_out is not None:
                 errors_out[name] = safe_error
-            logger.warning("MCP '%s': connection failed — %s", name, safe_error)
+            log_event(
+                logger,
+                logging.WARNING,
+                "mcp.connection.failed",
+                server=name,
+                duration_ms=round((time.monotonic() - started) * 1000, 2),
+                error_type=type(exc).__name__,
+                detail=safe_error,
+            )
             try:
                 await stack.aclose()
             except Exception:
@@ -281,16 +331,40 @@ class MCPToolWrapper(Tool):
     async def execute(self, **kwargs: Any) -> str:
         """调用 MCP 服务工具，返回文本结果；超时或异常时返回错误字符串。"""
         from mcp.types import TextContent
+        started = time.monotonic()
+        log_event(
+            logger,
+            logging.DEBUG,
+            "mcp.tool.started",
+            server=self._server_name,
+            tool=self._original_name,
+        )
         try:
             result = await asyncio.wait_for(
                 self._session.call_tool(self._original_name, arguments=kwargs),
                 timeout=self._timeout,
             )
         except asyncio.TimeoutError:
-            logger.warning("MCP tool '%s' timed out after %.0fs", self._name, self._timeout)
+            log_event(
+                logger,
+                logging.WARNING,
+                "mcp.tool.timed_out",
+                server=self._server_name,
+                tool=self._original_name,
+                duration_ms=round((time.monotonic() - started) * 1000, 2),
+                timeout_seconds=self._timeout,
+            )
             return f"(MCP tool '{self._name}' timed out after {self._timeout:.0f}s)"
         except Exception as exc:
-            logger.warning("MCP tool '%s' failed: %s: %s", self._name, type(exc).__name__, exc)
+            log_event(
+                logger,
+                logging.WARNING,
+                "mcp.tool.failed",
+                server=self._server_name,
+                tool=self._original_name,
+                duration_ms=round((time.monotonic() - started) * 1000, 2),
+                error_type=type(exc).__name__,
+            )
             return f"(MCP tool '{self._name}' failed: {type(exc).__name__}: {exc})"
 
         parts = []
@@ -299,7 +373,18 @@ class MCPToolWrapper(Tool):
                 parts.append(block.text)
             else:
                 parts.append(str(block))
-        return "\n".join(parts) or "(no output)"
+        output = "\n".join(parts) or "(no output)"
+        log_event(
+            logger,
+            logging.INFO,
+            "mcp.tool.completed",
+            server=self._server_name,
+            tool=self._original_name,
+            duration_ms=round((time.monotonic() - started) * 1000, 2),
+            content_blocks=len(result.content),
+            result_chars=len(output),
+        )
+        return output
 
 
 # ---------------------------------------------------------------------------
@@ -312,6 +397,7 @@ async def load_mcp_tools(
 ) -> None:
     """列举每个已连接 MCP 服务的工具并注册进工具注册表。"""
     for server_name, handle in handles.items():
+        started = time.monotonic()
         session = handle.session
         if session is None:
             logger.warning("MCP '%s': session unavailable, skipping tool load", server_name)
@@ -322,12 +408,22 @@ async def load_mcp_tools(
                 wrapper = MCPToolWrapper(session, server_name, tool_def)
                 registry.register(wrapper)
                 logger.info("MCP tool registered: %s", wrapper.name)
-            logger.info(
-                "MCP '%s': %d tool(s) loaded", server_name, len(result.tools)
+            log_event(
+                logger,
+                logging.INFO,
+                "mcp.tools.discovered",
+                server=server_name,
+                tool_count=len(result.tools),
+                duration_ms=round((time.monotonic() - started) * 1000, 2),
             )
         except Exception as exc:
-            logger.warning(
-                "MCP '%s': list_tools failed — %s: %s", server_name, type(exc).__name__, exc
+            log_event(
+                logger,
+                logging.WARNING,
+                "mcp.tools.discovery_failed",
+                server=server_name,
+                duration_ms=round((time.monotonic() - started) * 1000, 2),
+                error_type=type(exc).__name__,
             )
 
 
@@ -370,4 +466,14 @@ def _sanitize_connection_error(exc: Exception, config: dict[str, Any]) -> str:
         for secret in headers.values():
             if isinstance(secret, str) and secret:
                 text = text.replace(secret, "[redacted]")
-    return text[:500]
+    configured_env = config.get("env") or {}
+    if isinstance(configured_env, dict):
+        for key, secret in configured_env.items():
+            if (
+                isinstance(key, str)
+                and any(label in key.lower() for label in ("key", "token", "secret", "password"))
+                and isinstance(secret, str)
+                and secret
+            ):
+                text = text.replace(secret, "[redacted]")
+    return redact_sensitive_text(text)[:500]

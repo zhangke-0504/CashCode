@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import copy
 import logging
+import time
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
@@ -22,6 +23,7 @@ from typing import Any
 from ..llm.errors import is_expected_provider_failure
 from ..llm.models import LLMNotConfiguredError
 from ..llm.runtime import LLMRuntime, LLMSnapshot
+from ..logging_config import log_event, safe_exception_info
 from .store import MemoryStore
 
 logger = logging.getLogger(__name__)
@@ -223,6 +225,15 @@ class SimpleConsolidator:
         snapshot = copy.deepcopy(history)
         total_chars = self._estimate_chars(history)
         if total_chars < self._char_threshold:
+            log_event(
+                logger,
+                logging.DEBUG,
+                "consolidator.run.skipped",
+                chat_id=chat_id,
+                reason="below_threshold",
+                total_chars=total_chars,
+                threshold=self._char_threshold,
+            )
             return None
 
         # 边界基于完整 history（累计压缩）
@@ -231,10 +242,13 @@ class SimpleConsolidator:
         to_keep = snapshot[keep_from:]
 
         if not to_compress:
-            logger.debug(
-                "Consolidator: no-op for chat_id=%s "
-                "(all messages within keep boundary, keep_from=%d)",
-                chat_id, keep_from,
+            log_event(
+                logger,
+                logging.DEBUG,
+                "consolidator.run.skipped",
+                chat_id=chat_id,
+                reason="empty_compression_prefix",
+                keep_from=keep_from,
             )
             return None
 
@@ -242,12 +256,16 @@ class SimpleConsolidator:
         # 内存中的 history 消息不含 cursor 字段，需要读文件推导
         keep_from_cursor = self._store.get_keep_from_cursor(chat_id, len(to_keep))
 
-        logger.info(
-            "Consolidator: starting for chat_id=%s "
-            "(total_chars=%d >= threshold=%d, compress=%d msgs, keep=%d msgs, "
-            "keep_from_cursor=%s)",
-            chat_id, total_chars, self._char_threshold,
-            len(to_compress), len(to_keep), keep_from_cursor,
+        log_event(
+            logger,
+            logging.INFO,
+            "consolidator.run.prepared",
+            chat_id=chat_id,
+            total_chars=total_chars,
+            threshold=self._char_threshold,
+            compress_count=len(to_compress),
+            keep_count=len(to_keep),
+            keep_from_cursor=keep_from_cursor,
         )
 
         return ConsolidationPlan(
@@ -277,7 +295,15 @@ class SimpleConsolidator:
         provider: str | None,
         model: str | None,
     ) -> bool:
-
+        started = time.monotonic()
+        log_event(
+            logger,
+            logging.INFO,
+            "consolidator.run.started",
+            chat_id=plan.chat_id,
+            compress_count=len(plan.to_compress),
+            keep_count=plan.to_keep_count,
+        )
         try:
             lease = (
                 self._runtime.acquire(provider, model)
@@ -290,9 +316,23 @@ class SimpleConsolidator:
                     timeout=self._operation_timeout,
                 )
         except LLMNotConfiguredError:
-            logger.debug("Consolidator: LLM is not configured, skipping")
+            log_event(
+                logger,
+                logging.DEBUG,
+                "consolidator.run.skipped",
+                chat_id=plan.chat_id,
+                reason="llm_not_configured",
+                duration_ms=round((time.monotonic() - started) * 1000, 2),
+            )
             return False
         except asyncio.CancelledError:
+            log_event(
+                logger,
+                logging.INFO,
+                "consolidator.run.cancelled",
+                chat_id=plan.chat_id,
+                duration_ms=round((time.monotonic() - started) * 1000, 2),
+            )
             raise
         except Exception as exc:
             if is_expected_provider_failure(exc):
@@ -305,8 +345,17 @@ class SimpleConsolidator:
                 logger.warning(
                     "Consolidator: summarization failed for chat_id=%s",
                     plan.chat_id,
-                    exc_info=True,
+                    exc_info=safe_exception_info(exc),
                 )
+            log_event(
+                logger,
+                logging.WARNING,
+                "consolidator.run.failed",
+                chat_id=plan.chat_id,
+                phase="summarize",
+                duration_ms=round((time.monotonic() - started) * 1000, 2),
+                error_type=type(exc).__name__,
+            )
             return False
 
         try:
@@ -315,18 +364,31 @@ class SimpleConsolidator:
                 summary,
                 keep_from_cursor=plan.keep_from_cursor,
             )
-        except Exception:
+        except Exception as exc:
             logger.warning(
                 "Consolidator: failed to persist summary for chat_id=%s, "
                 "rolling back in-memory state",
                 plan.chat_id,
-                exc_info=True,
+                exc_info=safe_exception_info(exc),
+            )
+            log_event(
+                logger,
+                logging.WARNING,
+                "consolidator.run.failed",
+                chat_id=plan.chat_id,
+                phase="persist",
+                duration_ms=round((time.monotonic() - started) * 1000, 2),
+                error_type=type(exc).__name__,
             )
             return False
 
-        logger.info(
-            "Consolidator: done for chat_id=%s (keep=%d msgs)",
-            plan.chat_id,
-            plan.to_keep_count,
+        log_event(
+            logger,
+            logging.INFO,
+            "consolidator.run.completed",
+            chat_id=plan.chat_id,
+            keep_count=plan.to_keep_count,
+            summary_chars=len(summary),
+            duration_ms=round((time.monotonic() - started) * 1000, 2),
         )
         return True

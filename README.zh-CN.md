@@ -649,7 +649,33 @@ CASHCODE_ALLOWED_ORIGINS=http://127.0.0.1:5173,http://localhost:5173
 # WORKSPACE_DIR=/your/workspace/path
 # CASHCODE_DATA_DIR=/your/runtime/data/path
 # CASHCODE_CONFIG_DIR=/your/private/config/path
+
+# 持久化运行日志（以下为默认值）
+# CASHCODE_LOG_DIR=logs
+CASHCODE_FILE_LOG_LEVEL=DEBUG
+CASHCODE_CONSOLE_LOG_LEVEL=INFO
+CASHCODE_LOG_RETENTION_DAYS=10
 ```
+
+### 运行日志与测试输出
+
+后端默认以 UTF-8 追加写入 `server/logs/cashcode.log`。本地时间跨过午夜后的第一条记录会触发轮转，保留当天和此前 9 天，共 10 个日历日。相对路径形式的 `CASHCODE_LOG_DIR` 始终以 `server/` 为基准，不受进程工作目录影响；运行日志无法创建时服务会启动失败。生成的运行日志不会进入 Git。
+
+本地服务端验证统一使用已有的 Miniconda `AuWork` 环境。从仓库根目录执行以下命令，只依据项目 requirements 同步环境；需要持久化 pytest 输出时只能写入 `server/pytest_logs`：
+
+```powershell
+conda run -n AuWork python -m pip install --upgrade -r server/requirements.txt
+conda run -n AuWork python -m pytest server/tests *>> server/pytest_logs/pytest.log
+```
+
+前端开发与测试进程输出统一放在 `client/logs`。以下 PowerShell 命令使用追加模式，不会截断已有日志：
+
+```powershell
+npm --prefix client run dev *>> client/logs/vite.log
+npm --prefix client test *>> client/logs/test.log
+```
+
+`server/pytest_logs` 和 `client/logs` 都不是程序运行日志目录。浏览器控制台错误仍只保留在开发者工具中，不会自动上传。
 
 ### 启动服务
 

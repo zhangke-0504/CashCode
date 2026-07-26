@@ -2,6 +2,7 @@
 """会话管理 REST API：列举、重命名、删除。"""
 from __future__ import annotations
 
+import logging
 import shutil
 import os
 from pathlib import Path
@@ -11,8 +12,10 @@ from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, field_validator
 
 from ..memory.store import MemoryStore
+from ..logging_config import log_context, log_event
 
 router = APIRouter()
+logger = logging.getLogger(__name__)
 
 # 与 main.py 中 Agent 共享同一个 MemoryStore 根目录。
 # 列表、消息和删除仍可直接访问文件；重命名必须通过 Agent 同步实时缓存。
@@ -37,6 +40,7 @@ class RenameRequest(BaseModel):
 async def list_sessions() -> dict[str, Any]:
     """返回所有会话列表，按最近活跃时间降序。"""
     sessions = _store.list_sessions()
+    log_event(logger, logging.DEBUG, "session.list.completed", session_count=len(sessions))
     return {"sessions": sessions}
 
 
@@ -44,12 +48,19 @@ async def list_sessions() -> dict[str, Any]:
 async def get_session_messages(chat_id: str) -> dict[str, Any]:
     """返回会话中持久化的用户、助手消息及安全的能力选择收据。"""
 
-    chat_dir = _store.base_dir / chat_id
-    if not chat_dir.is_dir():
-        raise HTTPException(status_code=404, detail="session not found")
+    with log_context(chat_id=chat_id):
+        chat_dir = _store.base_dir / chat_id
+        if not chat_dir.is_dir():
+            raise HTTPException(status_code=404, detail="session not found")
 
-    messages = _store.load_public_history(chat_id)
-    return {"chat_id": chat_id, "messages": messages}
+        messages = _store.load_public_history(chat_id)
+        log_event(
+            logger,
+            logging.DEBUG,
+            "session.messages.loaded",
+            message_count=len(messages),
+        )
+        return {"chat_id": chat_id, "messages": messages}
 
 
 @router.patch("/sessions/{chat_id}")
@@ -58,21 +69,25 @@ async def rename_session(
 ) -> dict[str, Any]:
     """重命名指定会话。"""
 
-    agent = getattr(request.app.state, "agent", None)
-    if agent is None:
-        raise HTTPException(status_code=503, detail="agent unavailable")
-    try:
-        title = agent.rename_session(chat_id, body.title)
-    except FileNotFoundError:
-        raise HTTPException(status_code=404, detail="session not found")
-    return {"chat_id": chat_id, "title": title}
+    with log_context(chat_id=chat_id):
+        agent = getattr(request.app.state, "agent", None)
+        if agent is None:
+            raise HTTPException(status_code=503, detail="agent unavailable")
+        try:
+            title = agent.rename_session(chat_id, body.title)
+        except FileNotFoundError:
+            raise HTTPException(status_code=404, detail="session not found")
+        log_event(logger, logging.INFO, "session.renamed", title_chars=len(title))
+        return {"chat_id": chat_id, "title": title}
 
 
 @router.delete("/sessions/{chat_id}", status_code=204)
 async def delete_session(chat_id: str) -> None:
     """删除指定会话及其全部数据。"""
-    chat_dir = _store.base_dir / chat_id
-    if not chat_dir.exists():
-        raise HTTPException(status_code=404, detail="session not found")
+    with log_context(chat_id=chat_id):
+        chat_dir = _store.base_dir / chat_id
+        if not chat_dir.exists():
+            raise HTTPException(status_code=404, detail="session not found")
 
-    shutil.rmtree(chat_dir, ignore_errors=False)
+        shutil.rmtree(chat_dir, ignore_errors=False)
+        log_event(logger, logging.INFO, "session.deleted")

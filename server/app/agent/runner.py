@@ -1,12 +1,15 @@
 """非流式 ReAct Runner，返回完整且按用途投影的 Turn 轨迹。"""
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
+import time
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
 from ..llm.runtime import LLMRuntime, LLMSnapshot
+from ..logging_config import log_event, safe_exception_info
 from .tools.registry import ToolRegistry
 from .tools.result import ToolExecutionResult
 
@@ -100,7 +103,14 @@ class SimpleAgentRunner:
             }
             if schemas:
                 kwargs.update(tools=schemas, tool_choice="auto")
-            response = await snapshot.client.chat.completions.create(**kwargs)
+            response = await self._call_llm(
+                snapshot,
+                kwargs,
+                iteration=iteration + 1,
+                purpose="agent_iteration",
+                message_count=len(working),
+                tool_count=len(schemas),
+            )
 
             msg = response.choices[0].message
             tool_calls = msg.tool_calls
@@ -168,7 +178,12 @@ class SimpleAgentRunner:
                 model_delta.append(model_message)
                 durable_delta.append(durable_message)
 
-        logger.warning("Runner: max iterations reached for chat_id=%s", chat_id)
+        log_event(
+            logger,
+            logging.WARNING,
+            "agent.iteration.limit_reached",
+            iterations=self.MAX_ITERATIONS,
+        )
         working.append({"role": "user", "content": _MAX_ITERATIONS_MSG})
         final_text = await self._call_llm_text(snapshot, working)
         return TurnTrace(
@@ -184,10 +199,94 @@ class SimpleAgentRunner:
     async def _call_llm_text(
         self, snapshot: LLMSnapshot, messages: list[dict[str, Any]]
     ) -> str:
-        response = await snapshot.client.chat.completions.create(
-            model=snapshot.model, messages=messages, stream=False
+        response = await self._call_llm(
+            snapshot,
+            {"model": snapshot.model, "messages": messages, "stream": False},
+            iteration=self.MAX_ITERATIONS + 1,
+            purpose="max_iteration_final",
+            message_count=len(messages),
+            tool_count=0,
         )
         return response.choices[0].message.content or ""
+
+    async def _call_llm(
+        self,
+        snapshot: LLMSnapshot,
+        kwargs: dict[str, Any],
+        *,
+        iteration: int,
+        purpose: str,
+        message_count: int,
+        tool_count: int,
+    ) -> Any:
+        started = time.monotonic()
+        log_event(
+            logger,
+            logging.DEBUG,
+            "llm.call.started",
+            provider=snapshot.provider,
+            model=snapshot.model,
+            generation=snapshot.generation,
+            iteration=iteration,
+            purpose=purpose,
+            message_count=message_count,
+            tool_count=tool_count,
+        )
+        try:
+            response = await snapshot.client.chat.completions.create(**kwargs)
+        except asyncio.CancelledError:
+            log_event(
+                logger,
+                logging.INFO,
+                "llm.call.cancelled",
+                provider=snapshot.provider,
+                model=snapshot.model,
+                generation=snapshot.generation,
+                iteration=iteration,
+                purpose=purpose,
+                duration_ms=round((time.monotonic() - started) * 1000, 2),
+            )
+            raise
+        except Exception as exc:
+            logger.error(
+                "event=llm.call.failed provider=%s model=%s generation=%s "
+                "iteration=%s purpose=%s duration_ms=%.2f error_type=%s",
+                snapshot.provider,
+                snapshot.model,
+                snapshot.generation,
+                iteration,
+                purpose,
+                (time.monotonic() - started) * 1000,
+                type(exc).__name__,
+                exc_info=safe_exception_info(exc),
+            )
+            raise
+
+        choice = response.choices[0] if response.choices else None
+        usage = getattr(response, "usage", None)
+        log_event(
+            logger,
+            logging.INFO,
+            "llm.call.completed",
+            provider=snapshot.provider,
+            model=snapshot.model,
+            generation=snapshot.generation,
+            iteration=iteration,
+            purpose=purpose,
+            duration_ms=round((time.monotonic() - started) * 1000, 2),
+            finish_reason=getattr(choice, "finish_reason", None),
+            prompt_tokens=self._usage_value(usage, "prompt_tokens"),
+            completion_tokens=self._usage_value(usage, "completion_tokens"),
+            total_tokens=self._usage_value(usage, "total_tokens"),
+        )
+        return response
+
+    @staticmethod
+    def _usage_value(usage: Any, name: str) -> int | None:
+        if usage is None:
+            return None
+        value = usage.get(name) if isinstance(usage, dict) else getattr(usage, name, None)
+        return value if isinstance(value, int) else None
 
     async def _notify_tool_call(
         self,
